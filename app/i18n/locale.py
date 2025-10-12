@@ -40,6 +40,15 @@ _TR_MAP = str.maketrans({
 })
 
 
+TERM_MAP_TR_TO_SCHEMA.update({
+    "hava şartları": "weather",
+    "hava şartlarından": "weather",
+    "hava koşulları": "weather",
+    "iptal": "cancellation",
+    "uçuş iptali": "cancellation",
+    "uçuşların iptali": "cancellation",
+})
+
 
 
 def detect_lang(text:str)->str:

@@ -10,6 +10,9 @@ from app.services.unified import answer_unified
 from app.tools.retriever.schema import ensure_index, IDX_NAME
 from app.tools.retriever.seed_examples import seed as seed_jsonl
 
+from dotenv import load_dotenv
+load_dotenv()
+
 APP_TITLE = os.getenv("APP_TITLE", "THY Ops Copilot API")
 APP_VER   = os.getenv("APP_VER", "0.5.0")
 

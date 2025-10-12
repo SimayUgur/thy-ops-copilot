@@ -2,11 +2,11 @@
   "type": "function",
   "function": {
     "name": "graph_query",
-    "description": "NL→SQL graph orkestratörüyle soruyu çözer; uygun tabloyu, SQL'i ve satır önizlemesini üretir.",
+    "description": "NL→SQL graph orchestrator soruyu cozer; uygun tabloyu, SQL'i ve satir önizlemesini üretir.",
     "parameters": {
       "properties": {
         "question": {
-          "description": "Kullanıcının doğal dilde sorusu.",
+          "description": "User ın doğal dilde sorusu.",
           "title": "Question",
           "type": "string"
         },
@@ -20,7 +20,7 @@
         },
         "return_rows": {
           "default": true,
-          "description": "Satır önizlemesini döndür.",
+          "description": "Satir önizlemesini döndür.",
           "title": "Return Rows",
           "type": "boolean"
         },

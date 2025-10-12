@@ -1,11 +1,19 @@
-version: "3.9"
-
 services:
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:7.2.0-v10
     container_name: thy-redis
     ports:
       - "6379:6379"
+    environment:
+      - REDIS_ARGS=--appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 2s
+      retries: 10
 
   api:
     build: .
@@ -22,6 +30,12 @@ services:
       bash -lc "uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
 
   ui:
     build: .
@@ -38,3 +52,7 @@ services:
       bash -lc "streamlit run ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.0"
     ports:
       - "8501:8501"
+    restart: unless-stopped
+
+volumes:
+  redis-data:

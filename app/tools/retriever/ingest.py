@@ -7,6 +7,7 @@ from langchain_openai import OpenAIEmbeddings
 from app.tools.retriever.schema import get_redis, PREFIX
 from app.tools.retriever.fingerprint import dataset_fingerprint
 from app.i18n.locale import map_terms_to_schema, normalize_text
+from app.tools.retriever.search import canonicalize_prompt
 
 load_dotenv()
 

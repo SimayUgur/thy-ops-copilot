@@ -44,7 +44,7 @@ redis
 python-dotenv
 pydantic
 pydantic-settings
-
+langchain_tavily
 # ============================
 # Optional for UI
 # ============================
