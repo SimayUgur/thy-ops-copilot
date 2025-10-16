@@ -27,45 +27,27 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Ana container boşluk: üstte minimal, altta rahat */
 .block-container { padding-top: 0.6rem; padding-bottom: 1.0rem; }
-
-/* STICKY TOPBAR: her zaman görünür */
 #topbar {
-  position: sticky;
-  top: 0;
-  z-index: 9999;
+  position: sticky; top: 0; z-index: 9999;
   background: rgba(255,255,255,0.96);
   backdrop-filter: saturate(180%) blur(6px);
   border-bottom: 1px solid #eef2f7;
-  padding: 10px 6px 12px 6px;
-  margin: -6px 0 10px 0;
+  padding: 10px 6px 12px 6px; margin: -6px 0 10px 0;
   box-shadow: 0 1px 0 rgba(0,0,0,.03);
 }
-
-/* İç genişlik — main içeriğe hizala */
 #topbar .inner { max-width: 1200px; margin: 0 auto; padding: 0 12px; }
-
-/* Başlık ve alt başlık */
 .top-title { font-size: 40px; font-weight: 800; line-height: 1.05; margin: 0; }
 .top-sub   { font-size: 14px; color: #6b7280; margin: 4px 0 10px 0; }
-
-/* Quick Analysis etiket */
-.qa-badge {
-  display:inline-flex; align-items:center; gap:6px;
+.qa-badge { display:inline-flex; align-items:center; gap:6px;
   padding:2px 8px; border-radius:999px; background:#fff; border:1px solid #e5e7eb;
-  margin-bottom:8px;
-}
+  margin-bottom:8px; }
 .qa-emoji { font-size:12px; }
-
-/* Butonları “chip” gibi */
 .stButton > button {
   width: 100%; padding: 8px 10px;
   border:1px solid #e5e7eb; background:#fff; border-radius:999px; cursor:pointer;
 }
 .stButton > button:hover { background:#f8fafc; }
-
-/* Dark mode */
 @media (prefers-color-scheme: dark) {
   #topbar { background: rgba(17,17,17,0.92); border-bottom-color:#1f2937; }
   .top-sub { color:#9ca3af; }
@@ -79,26 +61,21 @@ st.markdown(
 # Helpers
 # =========================================================
 _SRC_BLOCK_RE   = re.compile(r"(?:\n|^)\s*(Kaynaklar|Sources)\s*:\s*(?:\n|$).*", re.IGNORECASE | re.DOTALL)
-# > [n] … (syf X) biçimindeki cümle-düzeyi kanıtları da gizle
 _QUOTE_LINES_RE = re.compile(r"(?:^|\n)\s*>\s*\[\d+\].*(?=\n|$)", re.MULTILINE)
 
 def _strip_sources_block(txt: str) -> str:
     """Cevap içindeki 'Kaynaklar:' bloğunu sohbetten gizle (sekmede göstereceğiz)."""
     if not isinstance(txt, str):
         return ""
-    #return _SRC_BLOCK_RE.sub("", txt).rstrip()
     out = _SRC_BLOCK_RE.sub("", txt)
-    out = _QUOTE_LINES_RE.sub("", out)
-   # artan boş satırları toparla
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
 
 def _strip_quote_lines(txt: str) -> str:
-    if not isinstance(txt, str): return ""
-    # '> [n]' ile başlayan satırları at
+    if not isinstance(txt, str):
+        return ""
     lines = [ln for ln in txt.splitlines() if not ln.lstrip().startswith("> [")]
     return "\n".join(lines).strip()
-
 
 def _get_api_base_default() -> str:
     try:
@@ -107,9 +84,15 @@ def _get_api_base_default() -> str:
         return os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 def ping_api(base: str) -> Tuple[bool, str]:
+    """Health check: versiyonu da döndür."""
     try:
         r = requests.get(f"{base.rstrip('/')}/healthz", timeout=5)
-        return (r.status_code == 200, "OK" if r.status_code == 200 else f"HTTP {r.status_code}")
+        if r.status_code == 200:
+            j = r.json()
+            ver = j.get("version") or j.get("ver") or "?"
+            idx = j.get("index") or "-"
+            return True, f"OK · v{ver} · {idx}"
+        return False, f"HTTP {r.status_code}"
     except Exception as e:
         return False, str(e)
 
@@ -126,7 +109,6 @@ def call_backend(question: str, base_url: str, session_id: str) -> Dict[str, Any
     return r.json()
 
 def call_backend_quick(question: str, base_url: str, session_id: str, prefer_tag: str) -> Dict[str, Any]:
-    """Quick Analysis tıklarında isteği cache-only gibi gönderiyoruz (ek alanlar API tarafında görmezden gelinir)."""
     payload = {
         "question": question, "preview_rows": 100,
         "return_rows": True, "return_chart": False, "top_k": 8,
@@ -139,6 +121,14 @@ def call_backend_quick(question: str, base_url: str, session_id: str, prefer_tag
     r.raise_for_status()
     return r.json()
 
+def _coalesce_sql_fields(d: Dict[str, Any]) -> str:
+    """SQL'i tek noktadan, boş-stringleri atlayarak seç."""
+    for key in ("sql", "final_sql", "executed_sql", "final_query", "sql_query"):
+        val = d.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
 # Geçmiş yardımcıları
 ExList = List[Dict[str, Any]]
 def get_exchanges() -> ExList:
@@ -150,15 +140,11 @@ def push_exchange(item: Dict[str, Any]) -> None:
     st.session_state["exchanges"] = lst[-MAX_HISTORY:]
 
 def list_last_questions(n: int = 3) -> List[str]:
-    """Son n soruyu (en yeni en üstte) ver."""
     items = get_exchanges()
     return [ex.get("q", "") for ex in reversed(items)][:n]
 
 def handle_local_commands(prompt: str) -> bool:
-    """'bir önceki soru', 'son 3 soru', 'geçmişi sil' gibi komutları backend'e gitmeden ele al."""
     t = (prompt or "").strip().lower()
-
-    # Son 3 soru
     if t in ("son 3 soru", "son üç soru", "last 3 questions", "history"):
         qs = list_last_questions(3)
         with st.chat_message("assistant"):
@@ -169,8 +155,6 @@ def handle_local_commands(prompt: str) -> bool:
                 for i, q in enumerate(qs, start=1):
                     st.markdown(f"{i}. {q}")
         return True
-
-    # Bir önceki soru
     if t in ("bir önceki soru neydi", "bir önceki soru", "önceki soru", "last question", "previous question"):
         items = get_exchanges()
         with st.chat_message("assistant"):
@@ -179,14 +163,11 @@ def handle_local_commands(prompt: str) -> bool:
             else:
                 st.markdown(f"**Bir önceki soru:** {items[-1].get('q','')}")
         return True
-
-    # Geçmişi temizle
     if t in ("geçmişi sil", "geçmişi temizle", "clear history", "reset"):
         st.session_state["exchanges"] = []
         with st.chat_message("assistant"):
             st.success("Geçmiş temizlendi.")
         return True
-
     return False
 
 # =========================================================
@@ -258,19 +239,31 @@ st.markdown('</div></div>', unsafe_allow_html=True)  # /.inner, /#topbar
 # =========================================================
 # Chat history (yalnızca son MAX_HISTORY)
 # =========================================================
-for ex in get_exchanges():
+for idx, ex in enumerate(get_exchanges()):
     with st.chat_message("user"):
         st.write(ex["q"])
     with st.chat_message("assistant"):
         used_cache = ex.get("used_cache"); use_web = ex.get("use_web")
         want_sql = ex.get("want_sql");     source = ex.get("source") or ""
+        default_show_quotes = bool(use_web and not want_sql)
+        show_quotes_msg = st.checkbox(
+            "Alıntıları göster", value=default_show_quotes, key=f"show_quotes_hist_{idx}"
+        )
+
         st.caption(
             f"used_cache: {'✅' if used_cache else '❌'} · "
             f"use_web: {'✅' if use_web else '❌'} · "
             f"want_sql: {'✅' if want_sql else '❌'} · "
             f"source: {source or '-'}"
         )
-        st.write(_strip_sources_block(ex.get("answer") or ""))
+        status_line = f"policy_status: {ex.get('policy_status','-')} · sql_status: {ex.get('sql_status','-')}"
+        st.caption(status_line)
+
+        answer_hist = _strip_sources_block(ex.get("answer") or "")
+        if not show_quotes_msg:
+            answer_hist = _strip_quote_lines(answer_hist)
+        st.write(answer_hist or "_(boş yanıt)_")
+
         tabs = st.tabs(["Tablo", "SQL", "Kaynaklar"])
         with tabs[0]:
             rows = ex.get("rows") or []
@@ -279,7 +272,7 @@ for ex in get_exchanges():
             else:
                 st.caption("Tablo verisi yok.")
         with tabs[1]:
-            sql_text = ex.get("sql") or ""
+            sql_text = _coalesce_sql_fields(ex) or ex.get("sql") or ""
             if sql_text:
                 st.code(sql_text, language="sql")
             else:
@@ -302,7 +295,6 @@ if _chosen and not prompt:
     prompt = _chosen
 
 if prompt:
-    # Önce yerel komutları ele al (backend'e gitmeden)
     if handle_local_commands(prompt):
         st.stop()
 
@@ -320,15 +312,19 @@ if prompt:
             st.error(f"Sunucuya erişilemedi: {e}")
     else:
         answer_raw = (data.get("final_answer") or data.get("analysis_text") or "").strip()
-        answer = _strip_sources_block(answer_raw)
-        answer = _strip_quote_lines(answer)
-        sql = data.get("sql") or ""
+        sql = _coalesce_sql_fields(data)
         rows = data.get("rows") or []
         citations = data.get("citations") or []
         used_cache = bool(data.get("used_cache"))
         use_web = bool(data.get("use_web"))
         want_sql = bool(data.get("want_sql"))
         source = (data.get("source") or "").strip()
+
+        # Yeni mesaja özel alıntı anahtarı (policy-only ise default True)
+        default_show_quotes_now = bool(use_web and not want_sql)
+        show_quotes_now = st.checkbox(
+            "Alıntıları göster", value=default_show_quotes_now, key=f"show_quotes_now_{uuid.uuid4()}"
+        )
 
         with st.chat_message("assistant"):
             st.caption(
@@ -337,7 +333,14 @@ if prompt:
                 f"want_sql: {'✅' if want_sql else '❌'} · "
                 f"source: {source or '-'}"
             )
+            status_line = f"policy_status: {data.get('policy_status','-')} · sql_status: {data.get('sql_status','-')}"
+            st.caption(status_line)
+
+            answer = _strip_sources_block(answer_raw)
+            if not show_quotes_now:
+                answer = _strip_quote_lines(answer)
             st.write(answer or "_(boş yanıt)_")
+
             tabs = st.tabs(["Tablo", "SQL", "Kaynaklar"])
             with tabs[0]:
                 if rows:
@@ -349,6 +352,17 @@ if prompt:
                     st.code(sql, language="sql")
                 else:
                     st.caption("SQL yok.")
+                    # --- Geçici debug: backend hangi alanları gönderdi gör ---
+                    with st.expander("Debug (SQL alanları)"):
+                        st.write({
+                            "sql": data.get("sql"),
+                            "final_sql": data.get("final_sql"),
+                            "executed_sql": data.get("executed_sql"),
+                            "final_query": data.get("final_query"),
+                            "sql_query": data.get("sql_query"),
+                            "sql_status": data.get("sql_status"),
+                            "source": data.get("source"),
+                        })
             with tabs[2]:
                 if citations:
                     for i, c in enumerate(citations, 1):
@@ -358,9 +372,17 @@ if prompt:
                 else:
                     st.caption("Kaynak yok.")
 
-        # Geçmişe ekle (sadece son 3 tur kalsın)
+        # Geçmişe ekle
         push_exchange({
-            "q": prompt, "answer": answer, "sql": sql,
-            "rows": rows, "citations": citations,
-            "used_cache": used_cache, "use_web": use_web, "want_sql": want_sql, "source": source,
+            "q": prompt,
+            "answer": _strip_sources_block(answer_raw),
+            "sql": sql,
+            "rows": rows,
+            "citations": citations,
+            "used_cache": used_cache,
+            "use_web": use_web,
+            "want_sql": want_sql,
+            "source": source,
+            "policy_status": data.get("policy_status"),
+            "sql_status": data.get("sql_status"),
         })

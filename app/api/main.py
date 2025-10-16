@@ -61,6 +61,12 @@ class AskUnifiedResponse(BaseModel):
     headline_metrics: Optional[List[Dict]] = None
     vega_lite_spec: Optional[Dict] = None
     sql: Optional[str] = None
+    final_sql: Optional[str] = None
+    executed_sql: Optional[str] = None
+    final_query: Optional[str] = None
+    sql_query: Optional[str] = None
+    sql_status: Optional[str] = None    # "ok" | "no_table" | "no_rows" | "error"
+    policy_status: Optional[str] = None
     rows: Optional[List[Dict]] = None
     columns: Optional[List[str]] = None
     citations: Optional[List[Dict]] = None

@@ -29,7 +29,13 @@ async def try_graph(q, preview_rows, return_chart, return_rows, session_id: str 
         "analysis_text": st.get("analysis_text"),
         "headline_metrics": st.get("headline_metrics") or [],
         "vega_lite_spec": st.get("vega_lite_spec") if return_chart else None,
-        "sql": final_sql or None,
+        "sql": final_sql or None,                   # toplulaştırılmış
+        "final_sql": st.get("final_sql"),           # ham alanlar (opsiyonel ama faydalı)
+        "executed_sql": st.get("executed_sql"),
+        "final_query": st.get("final_query"),
+        "sql_query": st.get("sql_query"),
+        "sql_status": st.get("sql_status"),
+        "policy_status": st.get("policy_status"),
         "rows": (rows if return_rows else []),
         "columns": list(rows[0].keys()) if (return_rows and rows) else [],
         "citations": st.get("citations") or st.get("policy_citations") or [],

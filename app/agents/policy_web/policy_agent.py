@@ -283,6 +283,11 @@ def rebuild_policy_index() -> None:
     if os.path.isdir(POLICY_INDEX_DIR) and not _list_versions(POLICY_INDEX_DIR):
         shutil.rmtree(POLICY_INDEX_DIR, ignore_errors=True)
     _build_index_csv_pdf(POLICY_CSV, POLICY_PDFS, POLICY_INDEX_DIR)
+    # >>> EKLE: cache'i sıfırla ve yeniden yükle
+    global _VS
+    _VS = None
+    _VS = _load_latest_index(POLICY_INDEX_DIR)
+
 
 
 # =========================== Splitters ===========================

@@ -4,14 +4,17 @@ from __future__ import annotations
 import ast
 import os
 import re
+import json
 from typing import TypedDict, List, Dict, Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 from langgraph.graph import StateGraph, START, END
-# NOT: Send kullanmıyoruz (dict bekleniyor), o yüzden import etmiyoruz
-from langgraph.constants import Send
 from langgraph.checkpoint.memory import MemorySaver
 
 # i18n normalize (tek giriş noktası)
@@ -52,8 +55,11 @@ DB_URL = os.getenv("DB_URL", "sqlite:///app/data/thy_ops.db")
 engine = create_engine(DB_URL, future=True)
 
 checkpointer = MemorySaver()
-
 USE_CKPT = os.getenv("LANGGRAPH_DISABLE_CHECKPOINT", "0") != "1"
+
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+_llm_split = ChatOpenAI(model=_OPENAI_MODEL, temperature=0)
+
 
 # ---------------- helpers ----------------
 def _dedup_column_extract(outputs: Dict[str, Dict[str, Any]]) -> List[List[str]]:
@@ -123,13 +129,8 @@ class FinalState(TypedDict, total=False):
     preview_rows: int
     rows: List[Dict[str, Any]]
     columns: List[str]
-    # analysis_text: str
-    # headline_metrics: List[Dict[str, Any]]
-    # vega_lite_spec: Dict[str, Any]
-    # want_analysis: bool
-    # want_chart: bool
 
-    # ⬇️ EKLENENLER: synth çıktılarının state'te kalması için
+    # ⬇️ Synth çıktılarını state'te tut
     final_answer: str
     final_sql: str
     rows_preview: List[Dict[str, Any]]
@@ -141,10 +142,16 @@ class FinalState(TypedDict, total=False):
     want_analysis: bool
     want_chart: bool
 
+    # hybrid split
+    policy_query_raw: str
+    sql_query_text: str
+
     # join/barrier kontrol
     policy_done: bool
     sql_done: bool
     arrived: List[str]
+    policy_status: str  # "ok" | "not_found" | "error"
+    sql_status: str     # "ok" | "no_table" | "no_rows" | "error"
 
 
 # ---------------- nodes ----------------
@@ -159,11 +166,14 @@ def policy_gate(state: FinalState):
     res = classify_intent(q)
 
     POLICY_KWS = [
-        r"\bpolitika\w*\b", r"\bkoşul(lar)?\b", r"\biade\w*\b", r"\bücret\w*\b",
-        r"\bkur(a|u)l\w*\b", r"\brefund\b", r"\bpolicy\b",
-        r"\bfazla\s*bagaj\b", r"\bbagaj\b", r"\bbaggage\b",
-        r"\bkupon(\s*sırası)?\b", r"\buçuş\s*kuponu\b",
-        r"\bstopover\b", r"\bduraklama\b", r"\bcodeshare\b", r"\bkod\s*paylaş\w*\b", r"\bcheck[- ]?in\b"
+        r"\bpolitika\w*\b", r"\bpolicy\b", r"\bkoşul\w*\b", r"\bsart\w*\b", r"\bşart\w*\b",
+        r"\biade\w*\b", r"\biptal\w*\b", r"\bücret\w*\b", r"\bfare\w*\b", r"\brefund\w*\b",
+        r"\bkur(?:a|u)l\w*\b",
+        r"\bbagaj\w*\b", r"\bbaggage\b", r"\bfazla\s*bagaj\w*\b", r"\bel\s*bagaj\w*\b",
+        r"\bkupon\w*\b", r"\buçuş\w*\s*kupon\w*\b", r"\bsıra\w*\b", r"\bkullan\w*\s*kupon\w*\b",
+        r"\bstopover\w*\b", r"\bduraklama\w*\b",
+        r"\bcodeshare\w*\b", r"\bkod\s*paylaş\w*\b",
+        r"\bcheck[- ]?in\b"
     ]
     SQL_KWS = [
         r"\bortalama\w*\b", r"\bavg\b", r"\btoplam\b", r"\bsum\b",
@@ -171,17 +181,27 @@ def policy_gate(state: FinalState):
         r"\bsay[ıi]s[ıi]\b", r"\ben\schok|en çok\b", r"\bmax\b", r"\bmin\b"
     ]
 
-    p_hit = any(re.search(p, q, flags=re.IGNORECASE) for p in POLICY_KWS)
-    s_hit = any(re.search(p, q, flags=re.IGNORECASE) for p in SQL_KWS)
+    p_hit = any(re.search(p, q, flags=re.IGNORECASE | re.UNICODE) for p in POLICY_KWS)
+    s_hit = any(re.search(p, q, flags=re.IGNORECASE | re.UNICODE) for p in SQL_KWS)
 
     # LLM kararı + keyword sinyali
     use_web  = bool(res.get("want_policy") or p_hit)
     want_sql = bool(res.get("want_sql")   or s_hit)
 
-    # --- SERT KURAL: Saf politika → SQL'i kapat ---
-    policy_only = p_hit and not s_hit
-    if policy_only:
+    # # Saf politika → SQL'i kapat (mevcut davranış değişmesin)
+    # policy_only = p_hit and not s_hit
+    # if policy_only:
+    #     want_sql = False
+
+    if p_hit and not s_hit:
         want_sql = False
+        use_web  = True
+
+    # ✅ Sert kural 2: Saf SQL ise policy'yi kapat (kırılan davranışı geri getirir)
+    if s_hit and not p_hit:
+        want_sql = True
+        use_web  = False
+        state["force_sql"] = True  # audit/debug için
 
     return {
         "use_web": use_web,
@@ -203,37 +223,63 @@ def policy_condition(state: FinalState):
     return "sql"
 
 
-import re
+# -------- HYBRID SPLIT: cümleleri policy/sql olarak ayır --------
+_split_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "Kullanıcının Türkçe sorusunu kısa parçalara böl ve her parçayı 'policy' ya da 'sql' olarak etiketle. "
+     "Sadece JSON döndür. Şema alanları uydurma. "
+     'JSON formatı: {"policy_parts": ["..."], "sql_parts": ["..."]}'),
+    ("human", "{question}")
+])
+_split_chain = _split_prompt | _llm_split | StrOutputParser()
 
+def hybrid_split_node(state: FinalState):
+    q = state.get("user_query") or state.get("raw_query") or ""
+    try:
+        out = _split_chain.invoke({"question": q}).strip()
+        data = json.loads(out)
+        pol_parts = [p.strip() for p in (data.get("policy_parts") or []) if p.strip()]
+        sql_parts = [p.strip() for p in (data.get("sql_parts") or []) if p.strip()]
+    except Exception:
+        pol_parts, sql_parts = [], []
+
+    # Heuristik takviye (LLM kaçırırsa)
+    if not pol_parts and re.search(r"(policy|politika|iade|iptal|bagaj|refund|kural)", q, re.I):
+        pol_parts = [q]
+    if not sql_parts and re.search(r"(ortalama|toplam|oran|trend|gecik|rötar|count|avg|sum|max|min)", q, re.I):
+        sql_parts = [q]
+
+    return {
+        "policy_query_raw": " ve ".join(pol_parts) if pol_parts else "",
+        "sql_query_text":   " ve ".join(sql_parts) if sql_parts else "",
+        "hybrid_split_done": True,
+    }
+
+
+# -------- POLICY PATH --------
 def policy_rewrite(state: FinalState):
     """
-    Hibrit/policy isteklerde, user_query içinden politikayla ilgili parçayı ayıklar.
-    Zaman penceresi ve SQL/analitik terimleri temizlenir.
+    Hibrit/policy isteklerde, policy tarafı için soruyu temizle.
     """
     if not state.get("use_web"):
         return {}
 
-    q = state.get("user_query", "") or ""
+    q = (state.get("policy_query_raw") or state.get("user_query") or "").strip()
     if not q:
         return {}
 
-    # 1) Parçalara ayır (bağlaçlar)
+    # Parçalama (bağlaçlar)
     parts = re.split(r"\b(?:ve|ile|,|;|/|&)\b", q, flags=re.IGNORECASE)
-
     POLICY_KWS = r"(politika|policy|iade|ücret|kural|kur(a|u)l|bagaj|baggage|refund)"
     policy_parts = [p.strip() for p in parts if re.search(POLICY_KWS, p, re.IGNORECASE)]
-
     cand = policy_parts[0] if policy_parts else q
 
-    # 2) Zaman penceresi & metrik temizliği
+    # Zaman & analitik metinleri çıkar
     cand = re.sub(r"\bson\s+\d+\s+(gün|hafta|ay|yıl)\b", "", cand, flags=re.IGNORECASE)
     cand = re.sub(r"\bge(çen|çtiğimiz)\s+(gün|hafta|ay|yıl)\b", "", cand, flags=re.IGNORECASE)
     cand = re.sub(r"\b\d+\s*(dk|dakika|saat|gün)\b", "", cand, flags=re.IGNORECASE)
-
-    # Analitik/metrik kelimeleri at
     cand = re.sub(r"\b(ortalama|avg|toplam|sum|oran|trend|gecikme|rötar|delay|sayısı?)\b", "", cand, flags=re.IGNORECASE)
 
-    # Temizle
     cand = re.sub(r"\s+", " ", cand).strip()
     if cand and not cand.endswith("?"):
         cand += "?"
@@ -247,64 +293,66 @@ def web_policy_node(state: FinalState):
     web = out.get("answer", "") or ""
     cits = out.get("citations", []) or []
 
+    status = "ok" if web.strip() else "not_found"
+
     base = {
         "web_answer": web,
         "policy_citations": cits,
         "citations": cits,       # synth’e de taşı
         "policy_done": True,
+        "policy_status": status,
     }
 
-    # POLICY-ONLY ise final'ı şimdiden doldur (UI hemen görebilsin)
+    # POLICY-ONLY ise final'ı şimdiden doldur
     if state.get("use_web") and not state.get("want_sql"):
-        base["final_answer"]  = web
-        base["analysis_text"] = web
+        base["final_answer"]  = web or "Politika tarafında uygun doküman bulunamadı."
+        base["analysis_text"] = base["final_answer"]
 
     return base
 
 
-def hybrid_fork(state: FinalState):
-    """
-    Paralel başlatıcı. LangGraph bu sürümde dict bekler; burada bayrak yazıp
-    graf üzerinde iki ayrı edge ile web_policy ve router'ı tetikleriz.
-    """
-    return {"hybrid_started": True}
-
-# def hybrid_fork(state: FinalState):
-#     # sadece SEND! kenar ekleme yok.
-#     return [Send("policy_rewrite", {}), Send("router", {})]
-
 # ------ SQL PATH ------
 def router(state: FinalState):
-    return {"router_out": route_agents(state["user_query"])}
+    q = state.get("sql_query_text") or state["user_query"]
+    return {"router_out": route_agents(q)}
 
 
 def route_request(state: FinalState):
     valid = {"flights", "complaints", "refunds", "weather"}
-    return [r for r in state.get("router_out", []) if r in valid]
+    targets = [r for r in state.get("router_out", []) if r in valid]
+    # Eğer hiç hedef yoksa işaretle
+    if not targets:
+        state["sql_status"] = state.get("sql_status") or "no_table"
+    return targets
+    #return [r for r in state.get("router_out", []) if r in valid]
 
 
 def flights_agent(state: FinalState):
-    sub = graph_final.invoke({"user_query": state["user_query"], "table_lst": ["flights"]})
+    q = state.get("sql_query_text") or state["user_query"]
+    sub = graph_final.invoke({"user_query": q, "table_lst": ["flights"]})
     return {"flights_out": sub}
 
 
 def complaints_agent(state: FinalState):
-    sub = graph_final.invoke({"user_query": state["user_query"], "table_lst": ["complaints"]})
+    q = state.get("sql_query_text") or state["user_query"]
+    sub = graph_final.invoke({"user_query": q, "table_lst": ["complaints"]})
     return {"complaints_out": sub}
 
 
 def refunds_agent(state: FinalState):
-    sub = graph_final.invoke({"user_query": state["user_query"], "table_lst": ["refunds"]})
+    q = state.get("sql_query_text") or state["user_query"]
+    sub = graph_final.invoke({"user_query": q, "table_lst": ["refunds"]})
     return {"refunds_out": sub}
 
 
 def weather_agent(state: FinalState):
-    sub = graph_final.invoke({"user_query": state["user_query"], "table_lst": ["weather"]})
+    q = state.get("sql_query_text") or state["user_query"]
+    sub = graph_final.invoke({"user_query": q, "table_lst": ["weather"]})
     return {"weather_out": sub}
 
 
 def filter_check(state: FinalState):
-    q = state["user_query"]
+    q = state.get("sql_query_text") or state["user_query"]
     collected = {
         "flights_out": state.get("flights_out", {}),
         "complaints_out": state.get("complaints_out", {}),
@@ -333,7 +381,7 @@ def fuzz_filter(state: FinalState):
 
 
 def query_generation(state: FinalState):
-    q = state["user_query"]
+    q = state.get("sql_query_text") or state["user_query"]
     col_str = state.get("filtered_col", "[]")
 
     cat_filters = state.get("fuzz_norm", ["no"])
@@ -358,7 +406,7 @@ def query_generation(state: FinalState):
 
 
 def query_validation(state: FinalState):
-    q = state["user_query"]
+    q = state.get("sql_query_text") or state["user_query"]
     col_str = state.get("filtered_col", "[]")
     sql_in = state.get("sql_query", "")
 
@@ -384,9 +432,14 @@ def execute_sql(state: FinalState):
 
     rows: List[Dict[str, Any]] = []
     cols: List[str] = []
+    status = state.get("sql_status") or None  # önceki işaret korunabilir
 
     if not sql or pr <= 0:
-        return {"rows": rows, "columns": cols, "sql_done": True}
+        # SQL metni yok → tablo bulunamadı ya da üretilemedi
+        return {
+            "rows": rows, "columns": cols, "sql_done": True,
+            "executed_sql": sql, "sql_status": status or "no_table"
+        }
 
     try:
         with engine.connect() as conn:
@@ -397,11 +450,18 @@ def execute_sql(state: FinalState):
                 cnt = conn.execute(text(f"SELECT COUNT(*) AS c FROM ({sql}) t")).scalar() or 0
             else:
                 cnt = len(rows)
+        # başarı: veri var/yok ayrımı
+        status = "ok" if cnt > 0 else "no_rows"
 
     except SQLAlchemyError:
         rows, cols, cnt = [], [], 0
+        status = "error"
 
-    return {"rows": rows, "columns": cols, "rowcount": cnt, "sql_done": True, "executed_sql": sql}
+    return {
+        "rows": rows, "columns": cols, "rowcount": cnt,
+        "sql_done": True, "executed_sql": sql, "sql_status": status
+    }
+
 
 
 def policy_safety(state: FinalState):
@@ -453,11 +513,10 @@ def synthesize_node(state: FinalState):
     )
     rows = state.get("rows", []) or []
     web  = state.get("web_answer", "") or ""
-    # citations: policy_citations öncelik, yoksa global citations
     citations = state.get("policy_citations", []) or state.get("citations", []) or []
     want_chart = bool(state.get("want_chart", False))
 
-    # --- POLICY-ONLY: web cevabı eksikse güvenli geri çağrı yap ---
+    # POLICY-ONLY güvenli geri çağrı
     if state.get("use_web") and not state.get("want_sql") and not web.strip():
         try:
             _out = answer_policy(q)
@@ -466,12 +525,11 @@ def synthesize_node(state: FinalState):
             state["web_answer"] = web
             state["policy_citations"] = citations
             state["policy_done"] = True
-            state["citations"] = citations  # synth için de taşı
+            state["citations"] = citations
         except Exception:
-            # sessiz düş; aşağıdaki fallback metinleri çalışır
             pass
 
-    # --- POLICY-ONLY: artık yanıt varsa direkt dön ---
+    # POLICY-ONLY: direkt dön
     if state.get("use_web") and not state.get("want_sql"):
         final_answer = web.strip() or "Politika cevabı üretilemedi."
         return {
@@ -479,17 +537,19 @@ def synthesize_node(state: FinalState):
             "analysis_text": final_answer,
             "headline_metrics": [],
             "vega_lite_spec": None,
-            "citations": citations,   # kaynakları koru
+            "citations": citations,
             "final_sql": "",
             "rows_preview": [],
         }
 
-    # --- SQL tarafı istenmiyorsa temizle ---
+    # SQL tarafı istenmiyorsa temizle
     if not state.get("want_sql", False):
         sql_for_payload = ""
         rows = []
 
     # HYBRID / SQL-ONLY birleştirme
+    policy_status = state.get("policy_status") or ("ok" if (state.get("web_answer") or "").strip() else "not_found")
+    sql_status    = state.get("sql_status") or ("ok" if rows else ("no_rows" if (state.get("executed_sql") or state.get("final_query")) else "no_table"))
     syn = synthesize_unified(
         question=q,
         sql=sql_for_payload,
@@ -502,31 +562,46 @@ def synthesize_node(state: FinalState):
     )
 
     # Güvenli fallback zinciri
-    final_answer = (syn.get("final_answer") or "").strip()
-    if not final_answer:
-        final_answer = (syn.get("analysis_text") or "").strip()
-    if not final_answer:
-        final_answer = web.strip()
-    if not final_answer:
-        if rows:
-            final_answer = "Sorgu çalıştı ve satırlar döndü; kısa özet üretilemedi."
-        elif sql_for_payload:
-            final_answer = "SQL hazır; önizleme satırı bulunamadı."
-        else:
-            final_answer = "Politika / SQL cevabı üretilemedi."
+    final_answer = (syn.get("final_answer") or "").strip() \
+        or (syn.get("analysis_text") or "").strip() \
+        or web.strip() \
+        or ("Sorgu çalıştı ve satırlar döndü; kısa özet üretilemedi." if rows else
+            ("SQL hazır; önizleme satırı bulunamadı." if sql_for_payload else "Politika / SQL cevabı üretilemedi."))
+
+
+     # --- Eksik taraf uyarıları (kısa, tek satır) ---
+    notes = []
+    if state.get("use_web") and policy_status != "ok":
+        notes.append("*(Policy notu: uygun doküman bulunamadı.)*")
+    if state.get("want_sql") and sql_status != "ok":
+        if sql_status == "no_table":
+            notes.append("*(SQL notu: ilgili tablo/kolon tespit edilemedi.)*")
+        elif sql_status == "no_rows":
+            notes.append("*(SQL notu: sorgu çalıştı ancak veri dönmedi.)*")
+        elif sql_status == "error":
+            notes.append("*(SQL notu: sorgu yürütme hatası.)*")
+
+    if notes:
+        final_answer = (final_answer + "\n\n" + "\n".join(notes)).strip()
 
     final_sql    = syn.get("final_sql") or sql_for_payload or ""
     rows_preview = syn.get("rows_preview") or (rows[:10] if isinstance(rows, list) else [])
+
 
     return {
         "final_answer": final_answer,
         "analysis_text": syn.get("analysis_text") or final_answer,
         "headline_metrics": syn.get("headline_metrics") or [],
         "vega_lite_spec": syn.get("vega_lite_spec"),
-        "citations": syn.get("citations", []) or citations,  # fallback koruması
+        "citations": syn.get("citations", []) or citations,
         "final_sql": final_sql,
+        "sql": final_sql,     # <<< UI geriye dönük alan
         "rows_preview": rows_preview,
+        "policy_status": policy_status,
+        "sql_status": sql_status,
     }
+    
+
 
 def policy_only_or_join(state: FinalState):
     # Policy-only ise direkt synthesize; aksi halde join’e
@@ -539,9 +614,10 @@ builder = StateGraph(FinalState)
 # nodes
 builder.add_node("normalize", normalize_node)
 builder.add_node("policy_gate", policy_gate)
+builder.add_node("hybrid_split", hybrid_split_node)
+
 builder.add_node("policy_rewrite", policy_rewrite)
 builder.add_node("web_policy", web_policy_node)
-builder.add_node("hybrid_fork", hybrid_fork)
 
 builder.add_node("router", router)
 builder.add_node("flights", flights_agent)
@@ -567,14 +643,17 @@ builder.add_edge("normalize", "policy_gate")
 builder.add_conditional_edges(
     "policy_gate",
     policy_condition,
-    {"web": "policy_rewrite", "sql": "router", "hybrid": "hybrid_fork"}
+    # web ve hybrid: önce hybrid_split → sonra iki kol da başlasın
+    {"web": "hybrid_split", "sql": "router", "hybrid": "hybrid_split"}
 )
 
-# HYBRID: fork düğümünden iki kola çık
-builder.add_edge("hybrid_fork", "policy_rewrite")
+# hybrid_split'ten policy ve sql kollarını başlat
+builder.add_edge("hybrid_split", "policy_rewrite")
+builder.add_edge("hybrid_split", "router")
+
+# policy kolu
 builder.add_edge("policy_rewrite", "web_policy")
 builder.add_edge("web_policy", "join")
-builder.add_edge("hybrid_fork", "router")
 
 # SQL path
 builder.add_conditional_edges(
@@ -612,4 +691,3 @@ if USE_CKPT:
     graph_main = builder.compile(checkpointer=checkpointer)
 else:
     graph_main = builder.compile()
-# graph_main = builder.compile(checkpointer=checkpointer)
