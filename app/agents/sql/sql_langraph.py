@@ -12,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from langgraph.graph import StateGraph, START, END
 # NOT: Send kullanmıyoruz (dict bekleniyor), o yüzden import etmiyoruz
 from langgraph.constants import Send
-from langgraph.checkpoint.memory import MemorySaver 
+from langgraph.checkpoint.memory import MemorySaver
 
 # i18n normalize (tek giriş noktası)
 from app.i18n.locale import map_terms_to_schema
@@ -30,8 +30,6 @@ from app.agents.sql.sql_agent_thy import (
     chain_query_extractor,
     chain_query_validator,
 )
-
-
 
 # Birleşik sentezleyici (SQL-only / Policy-only / Hybrid)
 from app.agents.synthesis.synthesizer import synthesize_unified
@@ -54,6 +52,8 @@ DB_URL = os.getenv("DB_URL", "sqlite:///app/data/thy_ops.db")
 engine = create_engine(DB_URL, future=True)
 
 checkpointer = MemorySaver()
+
+USE_CKPT = os.getenv("LANGGRAPH_DISABLE_CHECKPOINT", "0") != "1"
 
 # ---------------- helpers ----------------
 def _dedup_column_extract(outputs: Dict[str, Dict[str, Any]]) -> List[List[str]]:
@@ -123,6 +123,18 @@ class FinalState(TypedDict, total=False):
     preview_rows: int
     rows: List[Dict[str, Any]]
     columns: List[str]
+    # analysis_text: str
+    # headline_metrics: List[Dict[str, Any]]
+    # vega_lite_spec: Dict[str, Any]
+    # want_analysis: bool
+    # want_chart: bool
+
+    # ⬇️ EKLENENLER: synth çıktılarının state'te kalması için
+    final_answer: str
+    final_sql: str
+    rows_preview: List[Dict[str, Any]]
+    citations: List[Dict[str, str]]
+
     analysis_text: str
     headline_metrics: List[Dict[str, Any]]
     vega_lite_spec: Dict[str, Any]
@@ -142,33 +154,33 @@ def normalize_node(state: FinalState):
     return {"user_query": q_norm, "raw_query": raw, "term_map": applied}
 
 
-# app/agents/sql/sql_langraph.py (policy_gate)
-import re  # dosyanın başında
-
 def policy_gate(state: FinalState):
     q = state["user_query"]
     res = classify_intent(q)
 
     POLICY_KWS = [
         r"\bpolitika\w*\b", r"\bkoşul(lar)?\b", r"\biade\w*\b", r"\bücret\w*\b",
-        r"\bkur(a|u)l\w*\b", r"\brefund\b", r"\bpolicy\b", r"\bfazla\s*bagaj\b", r"\bbagaj\b", r"\bbaggage\b"
+        r"\bkur(a|u)l\w*\b", r"\brefund\b", r"\bpolicy\b",
+        r"\bfazla\s*bagaj\b", r"\bbagaj\b", r"\bbaggage\b",
+        r"\bkupon(\s*sırası)?\b", r"\buçuş\s*kuponu\b",
+        r"\bstopover\b", r"\bduraklama\b", r"\bcodeshare\b", r"\bkod\s*paylaş\w*\b", r"\bcheck[- ]?in\b"
     ]
-    # 👇 “geciken” ve “en çok” eklendi
     SQL_KWS = [
         r"\bortalama\w*\b", r"\bavg\b", r"\btoplam\b", r"\bsum\b",
-        r"\boran\w*\b", r"\btrend\w*\b", r"\bgecikme\w*\b", r"\bgecik\w*\b", r"\brötar\b",
-        r"\bdelay\b", r"\bsay[ıi]s[ıi]\b", r"\ben\schok|en çok\b", r"\bmax\b", r"\bmin\b"
+        r"\boran\w*\b", r"\btrend\w*\b", r"\bgecik\w*\b|\brötar\b|\bdelay\b",
+        r"\bsay[ıi]s[ıi]\b", r"\ben\schok|en çok\b", r"\bmax\b", r"\bmin\b"
     ]
 
     p_hit = any(re.search(p, q, flags=re.IGNORECASE) for p in POLICY_KWS)
     s_hit = any(re.search(p, q, flags=re.IGNORECASE) for p in SQL_KWS)
 
-    # LLM kararı temel alınır
+    # LLM kararı + keyword sinyali
     use_web  = bool(res.get("want_policy") or p_hit)
     want_sql = bool(res.get("want_sql")   or s_hit)
 
-    # ❗ Force policy-only SADECE LLM de SQL istemiyorsa
-    if use_web and not s_hit and not bool(res.get("want_sql")):
+    # --- SERT KURAL: Saf politika → SQL'i kapat ---
+    policy_only = p_hit and not s_hit
+    if policy_only:
         want_sql = False
 
     return {
@@ -180,12 +192,17 @@ def policy_gate(state: FinalState):
         "sql_score": float(res.get("sql_score", 0.0)) + (0.2 if s_hit else 0.0),
     }
 
+
 def policy_condition(state: FinalState):
     use_web = bool(state.get("use_web"))
     want_sql = bool(state.get("want_sql"))
-    if use_web and want_sql: return "hybrid"
-    if use_web:              return "web"
+    if use_web and want_sql:
+        return "hybrid"
+    if use_web:
+        return "web"
     return "sql"
+
+
 import re
 
 def policy_rewrite(state: FinalState):
@@ -225,14 +242,24 @@ def policy_rewrite(state: FinalState):
 
 
 def web_policy_node(state: FinalState):
-    q = state.get("policy_query") or state["user_query"] 
+    q = state.get("policy_query") or state["user_query"]
     out = answer_policy(q)
-    return {
-        "web_answer": out.get("answer", ""),
-        "policy_citations": out.get("citations", []),
+    web = out.get("answer", "") or ""
+    cits = out.get("citations", []) or []
+
+    base = {
+        "web_answer": web,
+        "policy_citations": cits,
+        "citations": cits,       # synth’e de taşı
         "policy_done": True,
     }
 
+    # POLICY-ONLY ise final'ı şimdiden doldur (UI hemen görebilsin)
+    if state.get("use_web") and not state.get("want_sql"):
+        base["final_answer"]  = web
+        base["analysis_text"] = web
+
+    return base
 
 
 def hybrid_fork(state: FinalState):
@@ -370,11 +397,11 @@ def execute_sql(state: FinalState):
                 cnt = conn.execute(text(f"SELECT COUNT(*) AS c FROM ({sql}) t")).scalar() or 0
             else:
                 cnt = len(rows)
-            
-    except SQLAlchemyError:
-        rows, cols,cnt = [], [],0
 
-    return {"rows": rows, "columns": cols,"rowcount": cnt, "sql_done": True,"executed_sql": sql}
+    except SQLAlchemyError:
+        rows, cols, cnt = [], [], 0
+
+    return {"rows": rows, "columns": cols, "rowcount": cnt, "sql_done": True, "executed_sql": sql}
 
 
 def policy_safety(state: FinalState):
@@ -391,6 +418,7 @@ def policy_safety(state: FinalState):
         return {
             "web_answer": out.get("answer", ""),
             "policy_citations": out.get("citations", []),
+            "citations": out.get("citations", []),
             "policy_done": True,
             "use_web": True,
         }
@@ -414,6 +442,7 @@ def join_condition(state: FinalState):
     arrived = set(state.get("arrived", []))
     return "go" if arrived.issuperset({"sql", "policy"}) else "wait"
 
+
 def synthesize_node(state: FinalState):
     q = state["user_query"]
     sql_for_payload = (
@@ -424,9 +453,43 @@ def synthesize_node(state: FinalState):
     )
     rows = state.get("rows", []) or []
     web  = state.get("web_answer", "") or ""
-    citations = state.get("policy_citations", []) or []
+    # citations: policy_citations öncelik, yoksa global citations
+    citations = state.get("policy_citations", []) or state.get("citations", []) or []
     want_chart = bool(state.get("want_chart", False))
 
+    # --- POLICY-ONLY: web cevabı eksikse güvenli geri çağrı yap ---
+    if state.get("use_web") and not state.get("want_sql") and not web.strip():
+        try:
+            _out = answer_policy(q)
+            web = (_out.get("answer") or "").strip()
+            citations = _out.get("citations", []) or []
+            state["web_answer"] = web
+            state["policy_citations"] = citations
+            state["policy_done"] = True
+            state["citations"] = citations  # synth için de taşı
+        except Exception:
+            # sessiz düş; aşağıdaki fallback metinleri çalışır
+            pass
+
+    # --- POLICY-ONLY: artık yanıt varsa direkt dön ---
+    if state.get("use_web") and not state.get("want_sql"):
+        final_answer = web.strip() or "Politika cevabı üretilemedi."
+        return {
+            "final_answer": final_answer,
+            "analysis_text": final_answer,
+            "headline_metrics": [],
+            "vega_lite_spec": None,
+            "citations": citations,   # kaynakları koru
+            "final_sql": "",
+            "rows_preview": [],
+        }
+
+    # --- SQL tarafı istenmiyorsa temizle ---
+    if not state.get("want_sql", False):
+        sql_for_payload = ""
+        rows = []
+
+    # HYBRID / SQL-ONLY birleştirme
     syn = synthesize_unified(
         question=q,
         sql=sql_for_payload,
@@ -438,7 +501,7 @@ def synthesize_node(state: FinalState):
         return_sql=True,
     )
 
-    #  Güvenli fallback zinciri 
+    # Güvenli fallback zinciri
     final_answer = (syn.get("final_answer") or "").strip()
     if not final_answer:
         final_answer = (syn.get("analysis_text") or "").strip()
@@ -460,12 +523,14 @@ def synthesize_node(state: FinalState):
         "analysis_text": syn.get("analysis_text") or final_answer,
         "headline_metrics": syn.get("headline_metrics") or [],
         "vega_lite_spec": syn.get("vega_lite_spec"),
-        "citations": syn.get("citations", []) or citations,
+        "citations": syn.get("citations", []) or citations,  # fallback koruması
         "final_sql": final_sql,
         "rows_preview": rows_preview,
     }
 
-
+def policy_only_or_join(state: FinalState):
+    # Policy-only ise direkt synthesize; aksi halde join’e
+    return "synthesize" if (state.get("use_web") and not state.get("want_sql")) else "join"
 
 
 # ---------------- graph build ----------------
@@ -499,16 +564,10 @@ builder.add_node("synthesize", synthesize_node)
 builder.add_edge(START, "normalize")
 builder.add_edge("normalize", "policy_gate")
 
-
-
 builder.add_conditional_edges(
     "policy_gate",
     policy_condition,
-    {
-        "web": "policy_rewrite",
-        "sql": "router",
-        "hybrid": "hybrid_fork",
-    }
+    {"web": "policy_rewrite", "sql": "router", "hybrid": "hybrid_fork"}
 )
 
 # HYBRID: fork düğümünden iki kola çık
@@ -516,7 +575,6 @@ builder.add_edge("hybrid_fork", "policy_rewrite")
 builder.add_edge("policy_rewrite", "web_policy")
 builder.add_edge("web_policy", "join")
 builder.add_edge("hybrid_fork", "router")
-
 
 # SQL path
 builder.add_conditional_edges(
@@ -538,7 +596,6 @@ builder.add_edge("fuzz_filter", "query_generator")
 builder.add_edge("query_generator", "query_validation")
 builder.add_edge("query_validation", "execute_sql")
 
-
 builder.add_edge("execute_sql", "policy_safety")
 builder.add_edge("policy_safety", "join")
 
@@ -551,4 +608,8 @@ builder.add_conditional_edges(
 
 builder.add_edge("synthesize", END)
 
-graph_main = builder.compile(checkpointer=checkpointer)
+if USE_CKPT:
+    graph_main = builder.compile(checkpointer=checkpointer)
+else:
+    graph_main = builder.compile()
+# graph_main = builder.compile(checkpointer=checkpointer)

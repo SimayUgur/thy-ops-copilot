@@ -1,7 +1,11 @@
 # app/api/main.py
+# app/api/main.py
+# import json
+# from pathlib import Path
 import os, time, uuid
 from typing import Optional, List, Dict
 from fastapi import FastAPI, Body, HTTPException, Header
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -9,6 +13,7 @@ from contextlib import asynccontextmanager
 from app.services.unified import answer_unified
 from app.tools.retriever.schema import ensure_index, IDX_NAME
 from app.tools.retriever.seed_examples import seed as seed_jsonl
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -74,14 +79,20 @@ async def ask_unified(req: AskUnifiedRequest = Body(...),
     t0 = time.time()
     session_id = (x_session_id or "").strip() or f"sess-{uuid.uuid4()}"  # benzersiz
 
-    out = await answer_unified(
-        question=req.question,
-        preview_rows=req.preview_rows,
-        return_rows=req.return_rows,
-        return_chart=req.return_chart,
-        top_k=req.top_k,
-        threshold=req.threshold,
-        session_id=session_id, 
-    )
+    try:
+        out = await answer_unified(
+            question=req.question,
+            preview_rows=req.preview_rows,
+            return_rows=req.return_rows,
+            return_chart=req.return_chart,
+            top_k=req.top_k,
+            threshold=req.threshold,
+            session_id=session_id, 
+        )
+    except Exception as e:
+        # burada logla ve boş gövde yerine açıklayıcı alanlarla dön
+        # (UI/cli testlerinde null yerin doldurulur)
+        raise HTTPException(status_code=500, detail=str(e))
+
     out["execution_ms"] = int((time.time() - t0) * 1000)
     return out

@@ -95,16 +95,29 @@ def _fallback_router(q: str) -> List[str]:
     ql = q.lower()
     agents = set()
 
+    weather_terms = ["weather", "hava", "hava durumu", "meteoroloji",
+                     "sis", "fog", "fırtına", "firtina", "storm",
+                     "yağmur", "yagmur", "rain", "kar", "snow",
+                     "buzlanma", "ice", "rüzgar", "ruzgar", "wind"]
+
     if any(w in ql for w in ["complaint", "şikayet", "sikayet", "category", "kategori", "trend", "günlük", "gunluk"]):
         agents.add("complaints")
 
     if any(w in ql for w in ["delay", "gecikme", "uçuş", "ucus", "flight", "aircraft", "crew", "weather_impact"]):
         agents.add("flights")
 
-    if any(w in ql for w in ["refund", "iade", "iptal", "cancel","cancellation","ucus iptali"]):
-        agents.add("refunds")
+    refunds_terms = ["refund", "iade", "iptal", "cancel", "cancellation", "ucus iptali"]
+    if any(w in ql for w in refunds_terms):
+        if ("iade" in ql or "refund" in ql) or ("cancel" in ql and "iade" in ql):
+            agents.add("refunds")
+        else:
+            # sadece 'iptal' + hava durumu ise, weather/flights yeterli
+            if "iptal" in ql and any(w in ql for w in weather_terms):
+                pass
+            else:
+                agents.add("refunds")
 
-    if any(w in ql for w in ["weather", "hava", "storm", "rain", "fog", "clear"]):
+    if any(w in ql for w in weather_terms):
         agents.add("weather")
 
     if not agents:

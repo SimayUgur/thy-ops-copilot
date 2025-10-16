@@ -146,13 +146,32 @@ def synthesize_unified(
         if return_sql:
             payload["final_sql"] = sql if isinstance(sql, str) else ""
             payload["rows_preview"] = rows[:10] if isinstance(rows, list) else []
-        return payload  # <-- FIX
+        return payload
 
-    # Sadece satır varsa SQL analizi üret (boş SQL policy'yi gölgelemesin)
+    # --- Uygunsuz/boş SQL'i filtrelemek için küçük yardımcı ---
+    def _is_useless_sql(s: str) -> bool:
+        if not isinstance(s, str) or not s.strip():
+            return True
+        low = s.lower()
+        # Tipik koruma: where 1=0
+        if " where 1=0" in low:
+            return True
+        # SELECT/WITH yoksa analiz yapılmaz
+        if not (low.strip().startswith("select") or low.strip().startswith("with")):
+            return True
+        return False
+
+    # Sadece hem geçerli SQL hem de veri satırı varsa SQL analizi üret
     has_rows = isinstance(rows, list) and len(rows) > 0
+    valid_sql = (isinstance(sql, str) and not _is_useless_sql(sql))
     sql_part: Optional[Dict[str, Any]] = None
-    if sql and has_rows:
-        sql_part = synthesize_sql(question=question, sql=sql, rows=rows, want_chart=want_chart)
+    if valid_sql and has_rows:
+        sql_part = synthesize_sql(
+            question=question,
+            sql=sql,
+            rows=rows,
+            want_chart=want_chart,
+        )
 
     # Policy zayıfsa ve SQL tarafı VARSA policy'yi at
     policy_text = (web_answer or "").strip()
@@ -160,13 +179,14 @@ def synthesize_unified(
         web_answer = ""
         web_citations = []
 
+    # ---- Tek taraflı durumlar ----
     # Policy-only
     if web_answer and not sql_part:
         out = {
             "analysis_text": web_answer.strip(),
             "headline_metrics": [],
             "vega_lite_spec": None,
-            "citations": web_citations,
+            "citations": list(web_citations or []),
         }
         out["final_answer"] = out["analysis_text"]
         return _with_sql(out)
@@ -188,10 +208,11 @@ def synthesize_unified(
         out["final_answer"] = out["analysis_text"]
         return _with_sql(out)
 
-    # HYBRID
+    # ---- HYBRID (policy + sql) ----
     if llm_merge:
         sql_len = len((sql_part or {}).get("analysis_text", ""))
         pol_len = len(web_answer or "")
+        # Çok kısa metinlerde LLM merge yerine basit birleştirme daha tutarlı
         if sql_len < 160 and pol_len < 320:
             llm_merge = False
         if llm_merge:
@@ -204,10 +225,9 @@ def synthesize_unified(
             }
             out["final_answer"] = merged
             return _with_sql(out)
-        else:
-            merged = f"{(sql_part or {}).get('analysis_text','').strip()}\n\n{(web_answer or '').strip()}".strip()
 
-    merged = f"{(sql_part or {}).get('analysis_text','').strip()}\n\n{web_answer.strip()}".strip()
+    # LLM merge kapalı/atlandı → basit birleştirme
+    merged = f"{(sql_part or {}).get('analysis_text','').strip()}\n\n{(web_answer or '').strip()}".strip()
     out = {
         "analysis_text": merged,
         "headline_metrics": (sql_part or {}).get("headline_metrics", []),
@@ -216,3 +236,4 @@ def synthesize_unified(
     }
     out["final_answer"] = merged
     return _with_sql(out)
+

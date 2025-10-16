@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import datetime as dt
 import sqlite3
+import subprocess, sys
 
 BASE = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE, "thy_ops.db")
@@ -84,3 +85,5 @@ def build():
 if __name__=="__main__":
     build()
     print("Seeded:", DB_PATH)
+    subprocess.run([sys.executable, "-m", "app.tools.build_vocab"], check=False)
+

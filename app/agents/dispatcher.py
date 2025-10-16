@@ -1,10 +1,15 @@
 # app/agents/dispatcher.py
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import os, re, json, asyncio
 from typing import Dict, Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+
 
 # ------------ Config ------------
 ROUTER_LLM_MODEL      = os.getenv("ROUTER_LLM_MODEL", "gpt-4o-mini")
@@ -13,7 +18,7 @@ ROUTER_THRESHOLD      = float(os.getenv("ROUTER_THRESHOLD", "0.6"))      # karar
 
 # ------------ Hızlı Regex Rules (fallback) ------------
 POLICY_PAT = [
-    r"\b(ücret|ucret|tarife|fare rule|kural|bilet|iade|kosul|koşul|hak|bagaj|fazla bagaj|el bagaji|check[- ]?in|no[- ]show|iade|iptal|değişiklik|refund|cancellation|bilet sınıfı)\b",
+    r"\b(ücret|ucret|tarife|fare rule|kural|bilet|kupon|kupon\s*sırası|uçuş kuponu|iade|kosul|koşul|hak|bagaj|fazla bagaj|el bagaji|check[- ]?in|no[- ]show|değişiklik|refund|cancellation|bilet sınıfı|stopover|duraklama|codeshare|kod\s*paylaş)\b",
     r"\b(politika|policy|şart|bilgi|sart|sikayet)\b",
     r"\b(hayvan|evcil|spor ekipmani|medikal|hamile|özel yardim)\b",
 ]
@@ -61,10 +66,11 @@ ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Question: {q}")
 ])
 
-async def _llm_route_async(q: str) -> Dict[str, Any]:
-    llm = ChatOpenAI(temperature=0, model=ROUTER_LLM_MODEL)
+# app/agents/dispatcher.py (ekle)
+def _llm_route_sync(q: str) -> Dict[str, Any]:
+    llm = ChatOpenAI(temperature=0, model=ROUTER_LLM_MODEL, timeout=ROUTER_LLM_TIMEOUT_S)
     msg = ROUTER_PROMPT.invoke({"q": q})
-    out = await llm.ainvoke(msg.to_messages())
+    out = llm.invoke(msg.to_messages())
     data = json.loads(out.content if hasattr(out, "content") else str(out))
 
     want_policy = bool(data.get("want_policy"))
@@ -73,7 +79,6 @@ async def _llm_route_async(q: str) -> Dict[str, Any]:
     window      = data.get("window_days") or 60
     reason      = f"llm: {data.get('reason','')} (conf={conf:.2f})"
 
-    # eşik altına düşerse belirsizlik: hybrid
     if conf < ROUTER_THRESHOLD:
         want_policy, want_sql = True, True
 
@@ -86,19 +91,11 @@ async def _llm_route_async(q: str) -> Dict[str, Any]:
         "llm_used": True,
     }
 
-# ------------ Public API ------------
+# mevcut classify_intent’i şöyle değiştir
 def classify_intent(q: str) -> Dict[str, Any]:
-    """
-    LLM-first: kısa timeout ile LLM; timeout/hata → regex fallback.
-    """
     try:
-        res = asyncio.run(asyncio.wait_for(_llm_route_async(q), timeout=ROUTER_LLM_TIMEOUT_S))
-        return res
+        return _llm_route_sync(q)  # ← async yerine sync yolu
     except Exception as e:
         fb = _fallback_rules(q)
-        fb["reason"] += f" | llm_timeout_or_error: {e}"
+        fb["reason"] += f" | llm_error: {e}"
         return fb
-
-
-def is_policy_query(q: str) -> bool:
-    return classify_intent(q)["want_policy"]

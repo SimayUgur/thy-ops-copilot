@@ -1,0 +1,57 @@
+{
+  "summary": {
+    "avg_overall": 0.685,
+    "pass": 1,
+    "total": 2
+  },
+  "results": [
+    {
+      "question": "Ücretli koltuk seçimi garanti midir?",
+      "answer": "Türk Hava Yolları, yolcularına koltuk seçim hakkı tanımaktadır, ancak bu seçimlerin garantisi\nbulunmamaktadır. Online check-in işlemi sırasında onaylanmış olsa bile, operasyonel ihtiyaçlar\ndoğrultusunda koltukların değiştirilebileceği belirtilmektedir. Bu durum, yolcuların tercih\nettikleri koltukları alacakları anlamına gelmemektedir ve dolayısıyla, koltuk seçimi garanti\nedilmemektedir.\n\n> [1] Konaklama ve Ulaşım Hizmeti  \nTazminat (uçağa kabul edilmeme ve\nalt hizmet sınıfına indirilmesi durumunda)\nY olcuların orijinal biletleri üzerinde görülen kalkış/varış noktalarına/noktalarından, \nalternatif sunulan uçuştaki kalkış/varış noktaları arasındaki ulaşım imkanları sunulur.Y olcuya sunulan yeni alternatif uçuşun kalkış saati arasındaki sürenin sekiz saat ve \nüzeri olması durumunda konaklama hizmeti verilir. (syf 1)\n> [1] Konaklama yeri ile havalimanı \narasındaki ulaşım hizmeti ücretsiz sağlanır.Hudut kuralları sebebiyle ülkeye girişin \nsağlanamadığı durumlarda yolcu, arındırılmış (transit) salonda bekletilir veya \nhavalimanının otel olanaklarına göre hizmet verilir. (syf 1)\n> [2] gerçekleştikten sonra tekrardan Türk Hava Yolları sayfasına geri dönecek ve bilet detaylarınızı \ngörebileceksiniz.https://www.paypal.com/vc/webapps/mpp/shop/faq sitesi üzerinden PayPal ile \nilgili detaylı bilgiye ulaşabilirsiniz. (syf 8)\n> [2] Rezervasyon işlemi sırasında belirtilen ülkelerde PayPal kabul ediyoruz.\"Öde\" düğmesine \ntıkladığınızda PayPal hesabınız ile ödeme yapabilirsiniz. (syf 8)\n\nKaynaklar:\n[1] yolcu_haklari.pdf file:///home/simay/thy_agentic_sql/app/data/yolcu_haklari.pdf#page=1\n[2] Online_kanallar_kullanim_sartlari.pdf file:///home/simay/thy_agentic_sql/app/data/Online_kanallar_kullanim_sartlari.pdf#page=8\n[3] Online_kanallar_kullanim_sartlari.pdf file:///home/simay/thy_agentic_sql/app/data/Online_kanallar_kullanim_sartlari.pdf#page=3\n\n(Son kontrol: 2025-10-15)",
+      "score": {
+        "faithfulness": 0.8,
+        "coverage": 0.7,
+        "formatting": 0.2,
+        "citations": 0.1,
+        "overall": 0.54,
+        "notes": "The answer provides a clear explanation regarding the lack of guarantee for seat selection, but the formatting does not follow the required structure. Additionally, the citations are not relevant to the question asked, which affects the overall score."
+      }
+    },
+    {
+      "question": "Bilet ücreti neleri kapsamaz? Vergi ve harçları kim öder?",
+      "answer": "Bilet ücreti, yalnızca kalkış noktasından varış noktasına kadar olan taşıma hizmetini kapsar ve ek\nhizmet ücretlerini içermez. Bu nedenle, bilet ücreti içerisinde vergi ve harçlar yer almaz; bu\nmasraflar yolcu tarafından ödenir. Yolcular, bilet alımında belirtilen ek hizmetler için ayrıca\nücret ödemekle yükümlüdürler. Dolayısıyla, bilet ücreti sadece taşıma hizmetini kapsarken, diğer\nmasraflar yolcunun sorumluluğundadır.\n\n> [1] MADDE 4 \nÜCRETLER VE GİDERLER \n4.1 GENEL \nBilet ücreti, ek hizmet ücretleri nin dahil olmadığı  sadece kalkış noktasındaki havaalanından varış noktası \nhavaalanına kadarki taşıma karşılığıdır.Aksi belirtilmedikçe; Bilet ücreti , havaalanları arasındaki ve \nhavaalanı ile ş ehir terminalleri arasındaki kara taşımasını  ve Yolcunun varış noktasından sonra yaptığı \nharcamaları kapsamaz. (syf 5)\n> [1] 6 / 18 \n3.3.3 Her bir Uçuş Kuponu, rezervasy onu kuponda yazılı tarihe ve uçuşun hizmet sınıfına göre taşıma için \nkabul edilecektir.Uçuş Kuponları rezervasyon kaydı olmadan düzenlenmişse, Yolcunun başvurusu üzerine, \nilgili ücret şartlarında ve talep edilen uçuşta müsait yer olması kaydıyla, rezervasyon yapılacaktır. (syf 5)\n> [2] gibi rezervasyonda bulunmayan bedeller düşüldükten sonra, aynı karta iade \nedilecektir.Depozito iadeleri banka iç iletişiminden kaynaklı olarak iade işlemi yapıldıktan 3-5 iş günü \niçerisinde kredi kartınıza yansımaktadır. (syf 18)\n> [2] kartı ile kiralama yapılamaz.Müşteri tarafından ibraz edilen kredi kartından, kiralama bedeline ek \nolarak, kiralanacak araç marka ve modeline göre belirli oranda depozit tahsilatı yapılmaktadır. (syf 18)\n\nKaynaklar:\n[1] yolcu_bagaj_tasima_genel_sartlar.pdf file:///home/simay/thy_agentic_sql/app/data/yolcu_bagaj_tasima_genel_sartlar.pdf#page=5\n[2] Online_kanallar_kullanim_sartlari.pdf file:///home/simay/thy_agentic_sql/app/data/Online_kanallar_kullanim_sartlari.pdf#page=18\n\n(Son kontrol: 2025-10-15)",
+      "score": {
+        "faithfulness": 1.0,
+        "coverage": 0.8,
+        "formatting": 1.0,
+        "citations": 0.5,
+        "overall": 0.83,
+        "notes": "The answer accurately describes what the ticket price does not cover and who is responsible for taxes and fees. However, the citations include some irrelevant quotes that do not directly support the main points. The formatting is well-structured with a clear paragraph followed by blockquotes and a sources list."
+      }
+    }
+  ],
+  "rubric": {
+    "dimensions": {
+      "faithfulness": {
+        "weight": 0.4,
+        "desc": "Cevap kaynaklarla tutarlı, uydurma yok"
+      },
+      "coverage": {
+        "weight": 0.3,
+        "desc": "Kritik noktaları ve istisnaları kapsıyor"
+      },
+      "formatting": {
+        "weight": 0.2,
+        "desc": "Paragraf + blockquote + Kaynaklar akışı"
+      },
+      "citations": {
+        "weight": 0.1,
+        "desc": "Yeterli, tekil, ilgili kaynakça"
+      }
+    },
+    "thresholds": {
+      "pass": 0.75
+    }
+  },
+  "model": "gpt-4o-mini"
+}

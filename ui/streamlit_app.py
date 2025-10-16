@@ -78,13 +78,27 @@ st.markdown(
 # =========================================================
 # Helpers
 # =========================================================
-_SRC_BLOCK_RE = re.compile(r"(?:\n|^)\s*Kaynaklar\s*:\s*(?:\n|$).*", re.IGNORECASE | re.DOTALL)
+_SRC_BLOCK_RE   = re.compile(r"(?:\n|^)\s*(Kaynaklar|Sources)\s*:\s*(?:\n|$).*", re.IGNORECASE | re.DOTALL)
+# > [n] … (syf X) biçimindeki cümle-düzeyi kanıtları da gizle
+_QUOTE_LINES_RE = re.compile(r"(?:^|\n)\s*>\s*\[\d+\].*(?=\n|$)", re.MULTILINE)
 
 def _strip_sources_block(txt: str) -> str:
     """Cevap içindeki 'Kaynaklar:' bloğunu sohbetten gizle (sekmede göstereceğiz)."""
     if not isinstance(txt, str):
         return ""
-    return _SRC_BLOCK_RE.sub("", txt).rstrip()
+    #return _SRC_BLOCK_RE.sub("", txt).rstrip()
+    out = _SRC_BLOCK_RE.sub("", txt)
+    out = _QUOTE_LINES_RE.sub("", out)
+   # artan boş satırları toparla
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+def _strip_quote_lines(txt: str) -> str:
+    if not isinstance(txt, str): return ""
+    # '> [n]' ile başlayan satırları at
+    lines = [ln for ln in txt.splitlines() if not ln.lstrip().startswith("> [")]
+    return "\n".join(lines).strip()
+
 
 def _get_api_base_default() -> str:
     try:
@@ -307,6 +321,7 @@ if prompt:
     else:
         answer_raw = (data.get("final_answer") or data.get("analysis_text") or "").strip()
         answer = _strip_sources_block(answer_raw)
+        answer = _strip_quote_lines(answer)
         sql = data.get("sql") or ""
         rows = data.get("rows") or []
         citations = data.get("citations") or []

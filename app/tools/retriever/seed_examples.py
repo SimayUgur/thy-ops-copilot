@@ -10,6 +10,7 @@ from app.tools.retriever.fingerprint import dataset_fingerprint
 from app.i18n.locale import map_terms_to_schema, normalize_text
 from langchain_openai import OpenAIEmbeddings
 from app.tools.retriever.search import canonicalize_prompt
+
 load_dotenv()
 
 EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")

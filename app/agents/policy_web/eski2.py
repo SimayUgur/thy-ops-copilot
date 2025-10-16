@@ -7,14 +7,13 @@
 # • Kaynaklar: SADECE kullanılan kaynaklar; özgün [idx] korunur (mapping bozmaz)
 # • Index versiyonlama: POLICY_INDEX_DIR/vYYYYMMDD, son 2 versiyon sakla
 # • Retry/Timeout: tenacity ile; LLM ve Tavily çağrılarında
-# • Eski API ile uyumluluk: sync/async fonksiyon imzaları korunmuştur
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
-import os, re, asyncio, datetime, hashlib, glob, shutil, textwrap
+import os, re, asyncio, datetime, hashlib, glob, shutil, math
 from typing import List, Dict, Any, Tuple, Optional
-
+import textwrap
 import pandas as pd
 from dotenv import load_dotenv, find_dotenv
 
@@ -77,9 +76,9 @@ POLICY_CSV = os.getenv("POLICY_CSV", "app/data/thy_qa_policy.csv")
 POLICY_PDFS = [p.strip() for p in os.getenv("POLICY_PDFS", "").split(",") if p.strip()]
 POLICY_INDEX_DIR = os.getenv("POLICY_INDEX_DIR", "app/data/thy_policy_index")
 
-RETRIEVE_K = int(os.getenv("POLICY_RETRIEVE_K", "3"))     # final k
-FETCH_K = max(RETRIEVE_K * 7, 20)                          # ilk çekiş (MMR toplu)
-RERANK_TOP = max(RETRIEVE_K * 3, 12)                       # rerank sonrası kırp
+RETRIEVE_K = int(os.getenv("POLICY_RETRIEVE_K", "3"))   # final k
+FETCH_K = max(RETRIEVE_K * 7, 20)                        # ilk çekiş (MMR toplu)
+RERANK_TOP = max(RETRIEVE_K * 3, 12)                     # rerank sonrası kırp
 
 CHUNK_TOKENS = int(os.getenv("POLICY_CHUNK_TOKENS", "700"))
 CHUNK_OVERLAP = int(os.getenv("POLICY_CHUNK_OVERLAP", "150"))
@@ -112,8 +111,7 @@ def _normalize_source_url(src: Optional[str]) -> str:
     return s
 
 def _hash_text(s: str, n: int = 512) -> str:
-    import hashlib as _hashlib
-    return _hashlib.sha256((s or "")[:n].encode("utf-8", "ignore")).hexdigest()
+    return hashlib.sha256((s or "")[:n].encode("utf-8", "ignore")).hexdigest()
 
 def _dedup_docs(docs: List[Document]) -> List[Document]:
     seen = set()
@@ -143,13 +141,6 @@ def _new_llm() -> ChatOpenAI:
 
 
 # =========================== sentence-level evidence ===========================
-
-QUOTE_MAX_SENT = int(os.getenv("POLICY_QUOTE_MAX_SENT", "2"))
-QUOTE_MAX_SENT = 1 if QUOTE_MAX_SENT < 1 else 2 if QUOTE_MAX_SENT > 2 else QUOTE_MAX_SENT
-
-# Sağlam cümle ayrıştırıcı: son noktalama işaretiyle birlikte cümleyi yakalar
-_SENT_RE = re.compile(r'[^\.!\?…]+[\.!\?…]')
-
 _SENT_SPLIT = re.compile(r'(?<=[\.!\?])\s+')
 
 KEY_PATTERNS = [
@@ -169,65 +160,58 @@ def _tokenize(txt: str) -> List[str]:
     return [w.lower() for w in _WORD.findall(txt or "")]
 
 def _idf_like(q_terms: List[str], s_terms: List[str]) -> float:
+    # basit idf benzeri ağırlık: kısıtlı bağlamda ters ağırlık üretilir
+    # (gerçek korpus idf'i yerine sorgu terim çeşitliliğini gözetir)
     if not q_terms or not s_terms:
         return 0.0
     qset = set(q_terms)
     inter = qset & set(s_terms)
     if not inter:
         return 0.0
+    # çeşitlilik ödülü
     return len(inter) / len(qset)
 
 def _score_sentence(q: str, s: str) -> float:
     qt = q.lower()
     st = s.lower()
+    # anahtar kelime eşleşmesi
     kw = 1.0 if (_KEY_RE.search(qt) and _KEY_RE.search(st)) else 0.0
+    # kelime kesişimi + idf benzeri
     q_terms = _tokenize(qt)
     s_terms = _tokenize(st)
     overlap = len(set(q_terms) & set(s_terms)) / max(1, len(set(q_terms)))
     idf_w = _idf_like(q_terms, s_terms)
+    # uzunluk cezası: çok kısa/çok uzun cümleyi kırp
     L = len(st)
     len_ok = 1.0 if 40 <= L <= 350 else 0.6 if 20 <= L <= 500 else 0.2
+    # “başlık/section” gibi sinyaller
     heading_boost = 0.1 if re.search(r"\b(bölüm|section|madde|3\.\d+)\b", st) else 0.0
+    # BM25-lite (parametreler sabit)
     base = (2.2 * overlap + 1.5 * idf_w) * len_ok + heading_boost
     return base + 0.8 * kw
 
-def _iter_sentences(text: str) -> List[str]:
+def _select_top_sentences(question: str, text: str, top_n: int = 2) -> List[str]:
     if not text:
         return []
-    sents = [m.group(0).strip() for m in _SENT_RE.finditer(text)]
+    # kaba cümle bölümü (noktalama temelli)
+    sents = _SENT_SPLIT.split(text)
+    # split sonucu: [sent0, sep, sent1, sep, ...] -> düzeltilmiş liste
+    fixed = []
+    for i in range(0, len(sents)-1, 2):
+        fixed.append((sents[i] + sents[i+1]).strip())
+    if not fixed and sents:
+        fixed = [sents[0].strip()]
+    # skorla
+    scored = [(s, _score_sentence(question, s)) for s in fixed if s]
+    scored.sort(key=lambda x: x[1], reverse=True)
     out = []
-    for s in sents:
-        s = re.sub(r'^[\-\–\—\•\·\s]+', '', s)  # baştaki tire/nokta işaretlerini temizle
-        if s:
-            out.append(s)
-    return out
-
-def _make_quote(sentences: List[str], i: int, max_sent: int = QUOTE_MAX_SENT) -> str:
-    take = [sentences[i]]
-    if max_sent >= 2 and i + 1 < len(sentences):
-        take.append(sentences[i + 1])
-    return " ".join(take).strip()
-
-def _select_top_sentences(question: str, text: str, top_n: int = 2) -> List[str]:
-    sents = _iter_sentences(text)
-    if not sents:
-        return []
-
-    candidates = []
-    for i in range(len(sents)):
-        quote = _make_quote(sents, i, QUOTE_MAX_SENT)  # 1–2 cümlelik blok
-        score = _score_sentence(question, sents[i])    # ilk cümleye göre skorla
-        candidates.append((quote, score))
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-
-    out, seen = [], set()
-    for q, _ in candidates:
-        h = _hash_text(q, n=256)
+    seen = set()
+    for s, _ in scored:
+        h = _hash_text(s, n=256)
         if h in seen:
             continue
         seen.add(h)
-        out.append(q)
+        out.append(s)
         if len(out) >= top_n:
             break
     return out
@@ -311,7 +295,10 @@ def _split_documents_advanced(docs: List[Document]) -> List[Document]:
 
     headers = [("#", "h1"), ("##", "h2"), ("###", "h3")]
     rc = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        encoding_name="cl100k_base", chunk_size=CHUNK_TOKENS, chunk_overlap=CHUNK_OVERLAP, disallowed_special=(),
+        encoding_name="cl100k_base",
+        chunk_size=CHUNK_TOKENS,
+        chunk_overlap=CHUNK_OVERLAP,
+        disallowed_special=(),
     )
     for d in long_docs:
         raw = d.page_content or ""
@@ -344,6 +331,7 @@ def _docs_from_csv(csv_path: str) -> List[Document]:
     norm = {c.strip().lower(): c for c in df.columns}
     if "question" not in norm or "answer" not in norm:
         raise ValueError("CSV must contain 'question' and 'answer' columns")
+
     docs: List[Document] = []
     for i, row in df.iterrows():
         q = str(row[norm["question"]]).strip()
@@ -388,16 +376,12 @@ _QA_PROMPT_BASE = ChatPromptTemplate.from_messages(
     [
         ("system",
          "Sen bir THY havayolu politika asistanısın. SADECE verilen bağlamdaki içeriklere dayanarak cevap ver. "
-         "Halüsinasyon yapma; bağlamda (context’te) olmayan sayısal/koşulsal detayları uydurma. "
+         "Halüsinasyon yapma; context içinde yani bağlamda olmayan sayısal/koşulsal detayları uydurma. "
          "Zaman penceresi sorulursa genel politikayı açıkla. "
          "ÇIKTIYI SADECE JSON OLARAK ver; 'Kaynaklar' bölümünü YAZMA. "
-         "Önce 'details' alanında tek parça, akıcı, bilgi yoğun ve ideal boyutta BİR paragraf üret. "
-         "ÇIKTI kuralları: details en fazla 90 kelime, tek paragraf. "
-         "Ardından 'bullets' alanında kısa maddeler üret. "
-         "bullets en fazla 3 madde; her madde ≤16 kelime. "
-         "Belirsiz/olasılık dili kullanma ('olabilir', 'talep edilebilir' vb. yok); sadece bağlamda yazanı söyle. "
-         "KULLANDIĞIN HER KANITA KARŞILIK GELEN [n] numarasını 'source_ids' alanına ekle; boş bırakma. "
-         "Cümle yarım kalmasın."
+         "Önce 'details' alanında tek parça, akıcı ve bilgi yoğun BİR paragraf üret; "
+         "sonra bullets alanında en fazla 4 madde çıkar. "
+         "KULLANDIĞIN HER KANITA KARŞILIK GELEN [n] numarasını 'source_ids' alanına ekle; boş bırakma."
         ),
         ("human",
          "Soru (TR):\n{question}\n\n"
@@ -406,7 +390,6 @@ _QA_PROMPT_BASE = ChatPromptTemplate.from_messages(
         ),
     ]
 )
-
 _QA_PROMPT = _QA_PROMPT_BASE.partial(format_instructions=_parser.get_format_instructions())
 
 _WIKI_PROMPT_BASE = ChatPromptTemplate.from_messages(
@@ -423,7 +406,6 @@ _WIKI_PROMPT_BASE = ChatPromptTemplate.from_messages(
     ]
 )
 _WIKI_PROMPT = _WIKI_PROMPT_BASE.partial(format_instructions=_parser.get_format_instructions())
-
 
 
 # =========================== Retry wrappers ===========================
@@ -477,6 +459,7 @@ def _mmr_then_rerank(vs: FAISS, question: str) -> List[Document]:
             docs = docs[:RERANK_TOP]
     except Exception:
         docs = docs[:RERANK_TOP]
+    # PDF öncelik
     docs.sort(key=lambda d: (d.metadata.get("weak", False), d.metadata.get("kind") != "pdf"))
     return docs[:RETRIEVE_K]
 
@@ -503,39 +486,8 @@ def _wiki_fetch() -> str:
 
 
 # =========================== QA engines ===========================
-def _limit_details_by_sentences(txt: str, max_words: int = 90) -> str:
-    if not txt: 
-        return txt
-    # Mevcut ayırıcıyı kullan
-    sents = re.split(r'(?<=[\.!\?])\s+', txt.strip())
-    out, total = [], 0
-    for s in sents:
-        w = len(s.split())
-        if total + w <= max_words or not out:  # en az bir cümle kalsın
-            out.append(s)
-            total += w
-        else:
-            break
-    return " ".join(out).strip()
-def _enforce_caps(ans: "PolicyAnswer") -> "PolicyAnswer":
-    # details: tek paragraf ve ≤90 kelime
-    ans.details = _limit_details_by_sentences((ans.details or "").strip(), 90)
-
-    # bullets: ≤3 madde, her madde ≤16 kelime
-    if ans.bullets is None:
-        ans.bullets = []
-    if len(ans.bullets) > 3:
-        ans.bullets = ans.bullets[:3]
-    trimmed = []
-    for b in ans.bullets:
-        w = (b or "").split()
-        trimmed.append(" ".join(w[:16]))
-    ans.bullets = [s.strip() for s in trimmed if s.strip()]
-    return ans
-
-
 def _dual_query(question: str) -> List[str]:
-    # EN sorular için TR varyantı da çek → recall artışı
+    # EN sorular için TR varyantı da çek → recall artışı (opsiyonel)
     try:
         from app.utils.text import detect_lang
         lang = detect_lang(question)
@@ -557,91 +509,53 @@ def _policy_json_answer(question: str, context_text: str) -> "PolicyAnswer":
         resp2 = _safe_llm_invoke(msg)
         text = resp2.content or text
     try:
-        ans = _parser.parse(text)
+        return _parser.parse(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.S)
-        ans = _parser.parse(m.group(0)) if m else PolicyAnswer()
-
-    # >>> BURASI: caps post-process
-    ans.details = _limit_details_by_sentences(ans.details, 90)
-    if len(ans.bullets) > 3:
-        ans.bullets = ans.bullets[:3]
-    ans.bullets = [" ".join(b.split()[:16]) for b in ans.bullets]
-
-    return ans
-
+        return _parser.parse(m.group(0)) if m else PolicyAnswer()
 
 def _wiki_json_answer(question: str, wiki_content: str) -> "PolicyAnswer":
     msg = _WIKI_PROMPT.invoke({"question": question, "content": wiki_content}).to_messages()
     resp = _safe_llm_invoke(msg)
     text = resp.content or "{}"
     try:
-        ans = _parser.parse(text)
+        return _parser.parse(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.S)
-        ans = _parser.parse(m.group(0)) if m else PolicyAnswer()
-
-    # >>> Caps
-    ans.details = _limit_details_by_sentences(ans.details, 90)
-    if len(ans.bullets) > 3:
-        ans.bullets = ans.bullets[:3]
-    ans.bullets = [" ".join(b.split()[:16]) for b in ans.bullets]
-
-    return ans
+        return _parser.parse(m.group(0)) if m else PolicyAnswer()
 
 
 # =========================== Rendering with sentence-level quotes ===========================
-def _pick_quotes_from_docs(
-    question: str,
-    docs: List[Document],
-    max_quotes_total: int = 3,   # ← default 3
-    per_doc: int = 2             # doküman başına aday sayısı
-) -> List[Tuple[int, str, Optional[int]]]:
+def _pick_quotes_from_docs(question: str, docs: List[Document], max_quotes_total: int = 4, per_doc: int = 2) -> List[Tuple[int, str, Optional[int]]]:
     """
-    Her dokümandan en fazla 'per_doc' adet 1–2 cümlelik alıntı adayı çıkar,
-    tüm adayları global skorla sırala, 3 taneye indir.
-    Dönüş: (doc_index, quote_text, page)
+    Geri dönen: [(source_index_1based, "alıntı cümle", page), ...]
+    - her doc için sentence-level seçim (BM25-lite + regex boost)
+    - pdf sayfa numarası metadata’dan alınır
     """
-    candidates: List[Tuple[float, int, str, Optional[int]]] = []  # (score, doc_idx, quote, page)
-
+    triples: List[Tuple[int, str, Optional[int]]] = []
     for i, d in enumerate(docs, start=1):
         text = (d.page_content or "").strip()
         if not text:
             continue
-        # per-doc en iyi alıntıları üret
-        sents = _iter_sentences(text)
+        sents = _select_top_sentences(question, text, top_n=per_doc)
         if not sents:
             continue
         page = _page_from_url(str(d.metadata.get("source", "")))
-
-        # cümle başına 1–2 cümlelik bloklar oluşturup adayla
-        local_candidates: List[Tuple[str, float]] = []
-        for j in range(len(sents)):
-            quote = _make_quote(sents, j, QUOTE_MAX_SENT)   # 1–2 cümle
-            score = _score_sentence(question, sents[j])     # skoru ilk cümleye göre
-            local_candidates.append((quote, score))
-
-        # bu dokümandan en iyi 'per_doc' adayı al
-        local_candidates.sort(key=lambda x: x[1], reverse=True)
-        for quote, score in local_candidates[:per_doc]:
-            candidates.append((score, i, quote.strip(), page))
-
-    # GLOBAL sıralama: en alakalı ilk sırada
-    candidates.sort(key=lambda x: x[0], reverse=True)
-
-    # dedup + kes
-    out: List[Tuple[int, str, Optional[int]]] = []
+        for s in sents:
+            triples.append((i, s.strip(), page))
+    # küresel seçim: en iyi cümleler zaten local’de sıralı; ilk N
+    # (daha agresif global skor istenirse _score_sentence ile yeniden skorlama yapılabilir)
     seen = set()
-    for _, doc_idx, quote, page in candidates:
-        h = _hash_text(quote, 256)
-        if h in seen:
+    out: List[Tuple[int, str, Optional[int]]] = []
+    for t in triples:
+        sig = (t[0], _hash_text(t[1], 256))
+        if sig in seen:
             continue
-        seen.add(h)
-        out.append((doc_idx, quote, page))
+        seen.add(sig)
+        out.append(t)
         if len(out) >= max_quotes_total:
             break
     return out
-
 
 def _strip_llm_sources_if_any(text: str) -> str:
     m = re.search(r"\nKaynaklar:\s*(?:\n|$)", text)
@@ -661,6 +575,7 @@ def _render_with_citations_structured(ans: "PolicyAnswer", citations: List[Dict[
             idx = c.get("orig_idx")
             title = (c.get("title") or "").strip()
             url = _normalize_source_url(c.get("url") or "").strip()
+            # özgün [idx] korunur ki blockquote referansı bozulmasın
             if idx is not None:
                 lines.append(f"[{idx}] {title} {url}".rstrip())
             else:
@@ -668,104 +583,60 @@ def _render_with_citations_structured(ans: "PolicyAnswer", citations: List[Dict[
     out = "\n".join(lines).strip()
     return _strip_llm_sources_if_any(out)
 
-def _nicely_truncate(s: str, limit: int = 220) -> str:
-    s = (s or "").strip()
-    if len(s) <= limit:
-        return s
-    cut = s[:limit]
-    # Önce en son noktalama işareti (., !, ?) üzerinden kısaltmayı dene
-    for p in [".", "!", "?"]:
-        i = cut.rfind(p)
-        if i >= int(limit * 0.6):  # çok baştan kesmesin
-            return cut[:i+1].strip() + "…"
-    # Olmazsa son boşlukta kes (kelime ortası olmasın)
-    i = cut.rfind(" ")
-    if i >= int(limit * 0.5):
-        return cut[:i].rstrip() + "…"
-    # En kötü durumda sert kes
-    return cut.rstrip() + "…"
+def _render_final(question: str,
+                  ans: "PolicyAnswer",
+                  docs: List[Document],
+                  all_citations: List[Dict[str, str]]) -> Tuple[str, List[Dict[str,str]]]:
+    """
+    Nihai metni üret:
+    1) detaylı paragraf
+    2) blockquote: cümle-düzeyi alıntılar ([idx] + (syf N))
+    3) Kaynaklar: SADECE kullanılan kaynaklar (özgün [idx] ile)
+    """
+    blocks = []
 
-
-
-
-def _render_final(
-    question: str,
-    ans: "PolicyAnswer",
-    docs: List[Document],
-    all_citations: List[Dict[str, str]]
-) -> Tuple[str, List[Dict[str, str]]]:
-    blocks: List[str] = []
-
-    # --- Details bloğu ---
+    # 1) detaylı paragraf
     if ans.details:
         blocks.append(textwrap.fill(ans.details.strip(), width=100))
 
-    # --- Alıntılar: her dokümandan en fazla 2, toplamda 4'e kadar; 1–2 cümle; trim + limit ---
-    quotes = _pick_quotes_from_docs(question, docs, max_quotes_total=3, per_doc=2)
+    # 2) alıntılar
+    quotes = _pick_quotes_from_docs(question, docs, max_quotes_total=4, per_doc=2)
     used_idx_from_quotes = sorted({idx for idx, _, _ in quotes})
 
-    MAX_Q = int(os.getenv("POLICY_QUOTE_MAX_CHARS", "220"))
-
-    def _normalize_ws(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "").strip())
-
-    def _first_1_2_sentences(s: str) -> str:
-        """
-        Metinden 1–2 sağlam cümleyi al. Cümle sonu: . ! ? veya … 
-        """
-        s = _normalize_ws(s)
-        parts = re.split(r"(?<=[\.!\?…])\s+", s)
-        take = parts[:2] if parts else []
-        out = " ".join(take).strip()
-        # Cümle sonu noktalaması yoksa, mevcut son noktalama kadar kes
-        if out and not re.search(r"[\.!\?…]$", out):
-            m = re.search(r"^.*[\.!\?…]", out)
-            if m:
-                out = m.group(0).strip()
-        return out
-
     if quotes:
-        qlines: List[str] = []
+        qlines = []
         for idx, sent, page in quotes:
-            base = _first_1_2_sentences(sent)
-
-            # Karakter limiti: mümkünse son noktalama içinde kes, değilse ellipsis ekle
-            short = base
-            if len(short) > MAX_Q:
-                cut = short[:MAX_Q].rstrip()
-                m = re.search(r"^(.*[\.!\?…])[^\.!\?…]*$", cut)
-                short = (m.group(1) if m else cut) + "…"
-
             tail = f" (syf {page})" if page else ""
-            qlines.append(f'> [{idx}] {short}{tail}')
+            qlines.append(f'> [{idx}] {sent}{tail}')
         blocks.append("\n".join(qlines))
 
-    # --- LLM'in döndürdüğü source_ids + kullanılan quote indekslerini birleştir ---
-    valid_ids = {i for i in range(1, len(docs) + 1)}
+    # 3) source_ids disiplin: LLM’in verdiğini temizle → sadece var olan ve kullanılanlar
+    valid_ids = {i for i in range(1, len(docs)+1)}
     llm_ids = [i for i in ans.source_ids if i in valid_ids]
+    # boşsa: alıntılardan doldur
     if not llm_ids:
         llm_ids = used_idx_from_quotes[:]
+    # nihai kullanılan set: alıntılar ∪ llm_ids
     used_idx = sorted(set(used_idx_from_quotes) | set(llm_ids))
 
-    # --- Son güncelleme ---
+    # 4) last_updated
     if ans.last_updated:
         blocks.append(f"Son güncelleme: {ans.last_updated}")
 
-    # --- Kaynak listesi (sadece kullanılanlar) ---
-    final_cits: List[Dict[str, str]] = []
+    # 5) Kaynaklar: yalnızca used_idx; özgün [idx] korunur
     if used_idx:
+        # all_citations listesi docs sırasıyla inşa edilmişti → orig_idx ekleyelim, filtreleyelim
+        final_cits: List[Dict[str, str]] = []
         for orig_i, c in enumerate(all_citations, start=1):
             if orig_i in used_idx:
-                final_cits.append({
-                    "title": c.get("title", ""),
-                    "url": c.get("url", ""),
-                    "orig_idx": orig_i
-                })
+                final_cits.append({"title": c.get("title",""),
+                                   "url": c.get("url",""),
+                                   "orig_idx": orig_i})
         if final_cits:
             lines = ["Kaynaklar:"]
             seen = set()
             for c in final_cits:
-                key = (c.get("title", "").strip(), c.get("url", "").strip(), c.get("orig_idx"))
+                key = (c.get("title","").strip(), c.get("url","").strip(), c.get("orig_idx"))
                 if key in seen:
                     continue
                 seen.add(key)
@@ -773,35 +644,74 @@ def _render_final(
                 url = _normalize_source_url(key[1]) if key[1] else ""
                 lines.append(f"[{key[2]}] {title} {url}".rstrip())
             blocks.append("\n".join(lines))
+    else:
+        final_cits = []
 
     text = "\n\n".join([b for b in blocks if b]).strip()
     return text, final_cits
 
 
+# =========================== Public API ===========================
+def answer_policy(query: str) -> Dict[str, Any]:
+    """
+    Single-call senaryo için sync API.
+    Guardrails:
+      - En az 1 blockquote + 1 kaynak yoksa, resmi sayfaya yönlendir.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
 
-
-# =========================== CORE (sync) helpers used by async wrappers ===========================
-def _run_offline_rag_once(query: str) -> Dict[str, Any]:
     vs = _get_vs()
+
+    # Kuruluş/genel bilgi -> wiki gate
+    wiki_first_patterns = [
+        r"\bkurul\w*\b", r"\btarihçe\b|\bhistory\b", r"\bgenel\s*merkez\b|\bmerkez[iı]\b",
+        r"\bceo\b|\bgenel\s*müdür\b|\byönetim\b", r"\bfilo\b|\buçak\s*sayısı\b|\bhub\b|\bmerkez\s*havaalan[ıi]\b",
+        r"\bstar\s*alliance\b|\bittifak\b|\büyeli[kğ]\b", r"\bsahip\b|\bortaklık\b|\bhisse\b", r"\bslogan\b|\blogo\b"
+    ]
+    if any(re.search(p, query, re.I) for p in wiki_first_patterns):
+        content = _wiki_fetch()
+        if content:
+            pa = _wiki_json_answer(query, content)
+            final_text = _render_with_citations_structured(
+                pa, [{"title": "Wikipedia - Türk Hava Yolları", "url": WIKI_URL, "orig_idx": 1}]
+            )
+            return {"answer": final_text + f"\n\n(Son kontrol: {_today_str()})",
+                    "citations": [{"title": "Wikipedia - Türk Hava Yolları", "url": WIKI_URL, "orig_idx": 1}],
+                    "last_checked": _today_str(), "source_channel": "wiki"}
+
+    # Offline-first RAG
     all_docs: List[Document] = []
     for q in _dual_query(query):
         all_docs.extend(_mmr_then_rerank(vs, q))
     docs = _dedup_docs(all_docs)[:RETRIEVE_K]
 
     if not docs:
-        # No offline—redirect to THY page
-        pa = PolicyAnswer(details="Güncel ve resmi bilgi için THY Bilgi Edin sayfasına bakınız.")
-        cits = [{"title": "THY - Bilgi Edin", "url": THY_INFO_URL, "orig_idx": 1}]
+        # Fallback wiki → yoksa yönlendirme
+        content = _wiki_fetch()
+        pa = _wiki_json_answer(query, content) if content else PolicyAnswer(
+            bullets=[], details="Güncel ve resmi bilgi için THY Bilgi Edin sayfasına bakınız.",
+            last_updated=None, source_ids=[]
+        )
+        cits = [{"title": "Wikipedia - Türk Hava Yolları", "url": WIKI_URL, "orig_idx": 1}] if content else \
+               [{"title": "THY - Bilgi Edin", "url": THY_INFO_URL, "orig_idx": 1}]
         final_text = _render_with_citations_structured(pa, cits)
         return {"answer": final_text + f"\n\n(Son kontrol: {_today_str()})",
                 "citations": cits, "last_checked": _today_str(),
-                "source_channel": "redirect"}
+                "source_channel": "wiki" if content else "redirect"}
 
     context_text, src_urls, src_titles = _format_context(docs)
     pa = _policy_json_answer(query, context_text)
+
+    # Citations’ın temel listesi (docs sıralı)
     base_cits = [{"title": t or "", "url": u} for u, t in zip(src_urls, src_titles)]
+
+    # Nihai render (cümle düzeyi)
     final_text, used_cits = _render_final(query, pa, docs, base_cits)
 
+    # Guardrail: alıntı + kaynak yoksa hard cap → yönlendirme
     has_quote = bool(re.search(r'^\>\s*\[\d+\]\s', final_text, re.M))
     has_cit = "Kaynaklar:" in final_text
     if not (has_quote and has_cit):
@@ -820,81 +730,6 @@ def _run_offline_rag_once(query: str) -> Dict[str, Any]:
         "last_checked": _today_str(),
         "source_channel": "csv_pdf_rag",
     }
-
-def _run_wiki_once(query: str) -> Dict[str, Any]:
-    content = _wiki_fetch()
-    if not content:
-        # No wiki content — graceful empty
-        return {"answer": "", "citations": [], "last_checked": _today_str(), "source_channel": "wiki"}
-    pa = _wiki_json_answer(query, content)
-    final_text = _render_with_citations_structured(
-        pa, [{"title": "Wikipedia - Türk Hava Yolları", "url": WIKI_URL, "orig_idx": 1}]
-    )
-    return {
-        "answer": final_text + f"\n\n(Son kontrol: {_today_str()})",
-        "citations": [{"title": "Wikipedia - Türk Hava Yolları", "url": WIKI_URL, "orig_idx": 1}],
-        "last_checked": _today_str(),
-        "source_channel": "wiki",
-    }
-
-_WIKI_FIRST_PATTERNS = [
-    r"\bkurul\w*\b", r"\btarihçe\b|\bhistory\b", r"\bgenel\s*merkez\b|\bmerkez[iı]\b",
-    r"\bceo\b|\bgenel\s*müdür\b|\byönetim\b", r"\bfilo\b|\buçak\s*sayısı\b|\bhub\b|\bmerkez\s*havaalan[ıi]\b",
-    r"\bstar\s*alliance\b|\bittifak\b|\büyeli[kğ]\b", r"\bsahip\b|\bortaklık\b|\bhisse\b", r"\bslogan\b|\blogo\b"
-]
-_WIKI_FIRST_COMPILED = [re.compile(p, re.I) for p in _WIKI_FIRST_PATTERNS]
-
-def _should_use_wiki_first(q: str) -> bool:
-    t = q or ""
-    return any(p.search(t) for p in _WIKI_FIRST_COMPILED)
-
-
-# =========================== Public API (legacy-compatible signatures) ===========================
-# --- 1) CSV/PDF RAG (async & sync) ---
-async def _answer_from_csv_pdf_rag(question: str) -> Dict[str, Any]:
-    # run blocking core in a thread to be loop-friendly
-    return await asyncio.to_thread(_run_offline_rag_once, question)
-
-def _answer_from_csv_pdf_rag_sync(question: str) -> Dict[str, Any]:
-    return _run_offline_rag_once(question)
-
-# --- 2) Wikipedia (async & sync) ---
-async def _answer_from_wiki(question: str) -> Dict[str, Any]:
-    return await asyncio.to_thread(_run_wiki_once, question)
-
-def _answer_from_wiki_sync(question: str) -> Dict[str, Any]:
-    return _run_wiki_once(question)
-
-# --- 3) Orchestration (async & sync) ---
-async def _answer_policy_async(query: str) -> Dict[str, Any]:
-    # 0) Wiki-first gate
-    if _should_use_wiki_first(query):
-        wiki = await _answer_from_wiki(query)
-        if wiki.get("answer"):
-            return wiki
-    # 1) Offline-first RAG
-    rag = await _answer_from_csv_pdf_rag(query)
-    if rag.get("answer"):
-        return rag
-    # 2) Fallback wiki
-    wiki = await _answer_from_wiki(query)
-    return wiki
-
-def _answer_policy_sync(query: str) -> Dict[str, Any]:
-    if _should_use_wiki_first(query):
-        wiki = _answer_from_wiki_sync(query)
-        if wiki.get("answer"):
-            return wiki
-    rag = _answer_from_csv_pdf_rag_sync(query)
-    if rag.get("answer"):
-        return rag
-    wiki = _answer_from_wiki_sync(query)
-    return wiki
-
-
-def answer_policy(query: str) -> Dict[str, Any]:
-    # CLI/Graph içinde nested loop sorunlarını kesin olarak engelle
-    return _answer_policy_sync(query)
 
 
 # =========================== Warmup ===========================

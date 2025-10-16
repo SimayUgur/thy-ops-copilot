@@ -1,8 +1,11 @@
 # app/tools/retriever/search.py
+from __future__ import annotations
 import os, json
 from typing import Tuple, Optional, Dict, Any, List
 import numpy as np
 from dotenv import load_dotenv
+from redis.exceptions import ResponseError, ConnectionError, TimeoutError
+
 from langchain_openai import OpenAIEmbeddings
 import app.tools.retriever.schema as schema
 get_redis = schema.get_redis
@@ -22,6 +25,8 @@ TOP_K  = int(os.getenv("HYBRID_TOP_K", "8"))
 
 TAG_FILTER = os.getenv("RETRIEVER_TAG_FILTER", "").strip()  # e.g. "approved|seed"
 
+# ------------------------ yardımcılar ------------------------
+
 def _to_bytes_float32(vec: List[float]) -> bytes:
     return np.array(vec, dtype=np.float32).tobytes(order="C")
 
@@ -29,9 +34,32 @@ def canonicalize_prompt(q: str) -> str:
     q_norm, _ = map_terms_to_schema(q)
     return " ".join(normalize_text(q_norm).split())
 
+# RediSearch query’lerinde sorun çıkaran karakterleri kaçışla
+_SPECIAL = set('@{}[]()|-=><,+~*&%:\'"\\')
+def _escape_query(s: str) -> str:
+    if not s:
+        return ""
+    out = []
+    for ch in s:
+        if ch in _SPECIAL:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
 def _tokenize_bm25(q: str) -> str:
+    """
+    Basit BM25 tokenizasyonu: alfasayısal ve boşluk bırak, diğerlerini boşluk yap.
+    Sonra (t1|t2|...) şeklinde bir OR grubu döndür.
+    """
     q = canonicalize_prompt(q)
-    toks = [t for t in q.replace("'", " ").replace('"', " ").replace(":", " ").split() if t]
+    cleaned = []
+    for ch in q:
+        if ch.isalnum() or ch.isspace():
+            cleaned.append(ch)
+        else:
+            cleaned.append(" ")
+    toks = [t for t in ("".join(cleaned)).split() if t]
     return "(" + "|".join(toks) + ")" if toks else "*"
 
 def _parse_hash(r, key: bytes) -> Dict[str, Any]:
@@ -54,37 +82,67 @@ def _parse_hash(r, key: bytes) -> Dict[str, Any]:
 def _tag_clause() -> str:
     if not TAG_FILTER:
         return ""
+    # TAG alanı için doğru sözdizimi: @tags:{approved|seed}
     return f"@tags:{{{TAG_FILTER}}}"
 
-# 🔹 EK: ultra hızlı EXACT MATCH (embedding çağırmadan)
+# ------------------------ aramalar ------------------------
+
 def search_exact(q: str) -> Optional[Dict[str, Any]]:
-    r = get_redis()
+    """
+    prompt_norm TEXT alanında "phrase-like" tam eşleşme denemesi.
+    - Güvenli kaçış
+    - DIALECT 2
+    - Hata olursa None (cache bypass)
+    """
     qn = canonicalize_prompt(q)
     tagc = _tag_clause()
-    exact_q = f'@prompt_norm:"{qn}"'
+    phrase = _escape_query(qn.lower())
+    query = f'@prompt_norm:"{phrase}"'
     if tagc:
-        exact_q = f"({exact_q} {tagc})"
-    res = r.execute_command("FT.SEARCH", IDX_NAME, exact_q, "NOCONTENT", "LIMIT", "0", "1")
-    if res and res[0] >= 1:
-        key = res[1]
-        return _parse_hash(r, key)
-    return None
+        query = f"({query} {tagc})"
+
+    try:
+        r = get_redis()
+        res = r.execute_command(
+            "FT.SEARCH", IDX_NAME, query,
+            "NOCONTENT", "LIMIT", "0", "1",
+            "DIALECT", "2"
+        )
+        if res and isinstance(res, list) and res[0] >= 1:
+            key = res[1]
+            return _parse_hash(r, key)
+        return None
+    except (ResponseError, ConnectionError, TimeoutError):
+        return None
+    except Exception:
+        return None
 
 def hybrid_search(q: str, k:int=TOP_K) -> List[Tuple[float, Dict[str,Any]]]:
     r = get_redis()
     q_norm = canonicalize_prompt(q)
 
-    # 0) EXACT MATCH kısayolu
+    # 0) EXACT MATCH kısa yolu
     tagc = _tag_clause()
-    exact_q = f'@prompt_norm:"{q_norm}"'
+    phrase = _escape_query(q_norm.lower())
+    exact_q = f'@prompt_norm:"{phrase}"'
     exact_q = f"({exact_q} {tagc})" if tagc else exact_q
-    exact_res = r.execute_command("FT.SEARCH", IDX_NAME, exact_q, "NOCONTENT", "LIMIT", "0", "1")
+    try:
+        exact_res = r.execute_command(
+            "FT.SEARCH", IDX_NAME, exact_q,
+            "NOCONTENT", "LIMIT", "0", "1",
+            "DIALECT", "2"
+        )
+    except (ResponseError, ConnectionError, TimeoutError):
+        exact_res = None
+    except Exception:
+        exact_res = None
+
     if exact_res and exact_res[0] >= 1:
         key = exact_res[1]
         doc = _parse_hash(r, key)
         return [(1.10, doc)]
 
-    # 1) KNN
+    # 1) KNN (vektör)
     vec = emb.embed_query(q_norm)
     vec_bytes = _to_bytes_float32(vec)
     base_filter = tagc if tagc else "*"
@@ -97,7 +155,12 @@ def hybrid_search(q: str, k:int=TOP_K) -> List[Tuple[float, Dict[str,Any]]]:
         "DIALECT", "2",
         "LIMIT", "0", str(k)
     ]
-    knn_res = r.execute_command(*knn_cmd)
+    try:
+        knn_res = r.execute_command(*knn_cmd)
+    except (ResponseError, ConnectionError, TimeoutError):
+        knn_res = None
+    except Exception:
+        knn_res = None
 
     vec_dist: Dict[bytes, float] = {}
     if knn_res and knn_res[0] > 0:
@@ -106,7 +169,8 @@ def hybrid_search(q: str, k:int=TOP_K) -> List[Tuple[float, Dict[str,Any]]]:
             fields = knn_res[i+1]
             d = None
             for j in range(0, len(fields), 2):
-                if fields[j].decode() == "__vec_score":
+                fname = fields[j].decode() if isinstance(fields[j], (bytes, bytearray)) else fields[j]
+                if fname == "__vec_score":
                     fval = fields[j+1]
                     d = float(fval.decode() if isinstance(fval, (bytes, bytearray)) else fval)
                     break
@@ -126,8 +190,18 @@ def hybrid_search(q: str, k:int=TOP_K) -> List[Tuple[float, Dict[str,Any]]]:
     bm25_q = f"(@prompt_norm:{bm25_text})"
     if tagc:
         bm25_q = f"({bm25_q} {tagc})"
-    bm25_cmd = ["FT.SEARCH", IDX_NAME, bm25_q, "WITHSCORES", "NOCONTENT", "LIMIT", "0", str(k)]
-    bm25_res = r.execute_command(*bm25_cmd)
+    bm25_cmd = [
+        "FT.SEARCH", IDX_NAME, bm25_q,
+        "WITHSCORES", "NOCONTENT",
+        "LIMIT", "0", str(k),
+        "DIALECT", "2"
+    ]
+    try:
+        bm25_res = r.execute_command(*bm25_cmd)
+    except (ResponseError, ConnectionError, TimeoutError):
+        bm25_res = None
+    except Exception:
+        bm25_res = None
 
     bm25_raw: Dict[bytes, float] = {}
     if bm25_res and bm25_res[0] > 0:

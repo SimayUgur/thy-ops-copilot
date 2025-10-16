@@ -18,8 +18,10 @@ anthropic
 # Data Processing & Retrieval
 # ============================
 pandas
-faiss-cpu
-rank-bm25
+faiss-cpu==1.8.0.post1
+rank-bm25>=0.2.2,<0.3
+tiktoken>=0.5,<0.12
+pypdf>=4.3,<6
 # ============================
 # Backend & API
 # ============================
